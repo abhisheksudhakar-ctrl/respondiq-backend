@@ -1,0 +1,18 @@
+{
+  "name": "respondiq-backend",
+  "version": "12.1.0",
+  "description": "RespondIQ v12.1 — Gemini 3.1 Pro (MEDIUM thinking + Search Grounding) + Email/Webhook Proxy (Render.com)",
+  "private": true,
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "@google/genai": "^1.0.0",
+    "google-ads-api": "^16.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
