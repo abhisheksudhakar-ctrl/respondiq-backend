@@ -1,213 +1,167 @@
 // ══════════════════════════════════════════════════════════════
 // competitive-intel-service.js
 // Google Ads Transparency Center - FREE Competitive Intelligence
-// Uses reverse-engineered internal API (no paid keys, no browser)
-// Mirrors keyword-service.js pattern for consistency
+// Uses Python bridge to reverse-engineered Google internal API
 // ══════════════════════════════════════════════════════════════
+
+const { execSync } = require('child_process');
+const path = require('path');
+const fs = require('fs');
 
 // ── In-memory cache (competitor data is stable within a day) ──
 const cache = new Map();
 const CACHE_TTL = 12 * 60 * 60 * 1000; // 12 hours
 
-// ── Google Ads Transparency Center internal endpoints ──
-const TRANSPARENCY_BASE = 'https://adstransparency.google.com';
-const SEARCH_ENDPOINT = TRANSPARENCY_BASE + '/anji/_/rpc/SearchService/SearchCreatives';
-const SUGGEST_ENDPOINT = TRANSPARENCY_BASE + '/anji/_/rpc/SearchService/GetSuggestions';
+// ── Python scraper script (embedded, auto-written to disk on first call) ──
+const PYTHON_SCRIPT = `
+import sys
+import json
 
-// ── Common headers that mimic the Transparency Center frontend ──
-function getHeaders() {
-  return {
-    'Content-Type': 'application/x-www-form-urlencoded',
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-    'Accept': '*/*',
-    'Accept-Language': 'en-US,en;q=0.9',
-    'Origin': TRANSPARENCY_BASE,
-    'Referer': TRANSPARENCY_BASE + '/',
-  };
+def search_competitor(query):
+    result = {
+        "query": query,
+        "found": False,
+        "best_match": None,
+        "suggestions": []
+    }
+
+    try:
+        from GoogleAds import GoogleAds
+        a = GoogleAds()
+
+        suggestions_raw = a.get_all_search_suggestions(query)
+        if not suggestions_raw or not isinstance(suggestions_raw, list):
+            return result
+
+        parsed = []
+        for s in suggestions_raw:
+            info = s.get("1", {})
+            if not info:
+                continue
+            name = info.get("1", "")
+            adv_id = info.get("2", "")
+            country = info.get("3", "")
+            ad_count_raw = info.get("4", {}).get("2", {})
+            ad_count = "0"
+            if isinstance(ad_count_raw, dict):
+                ad_count = ad_count_raw.get("1", "0")
+            verified = info.get("5", False)
+
+            if name and adv_id and adv_id.startswith("AR"):
+                parsed.append({
+                    "name": name,
+                    "advertiser_id": adv_id,
+                    "country": country,
+                    "ad_count": int(ad_count) if str(ad_count).isdigit() else 0,
+                    "verified": bool(verified)
+                })
+
+        result["suggestions"] = parsed
+
+        if not parsed:
+            return result
+
+        # Pick best match: prefer US > GB > highest ad count
+        with_ads = [p for p in parsed if p["ad_count"] > 0]
+        pool = with_ads if with_ads else parsed
+
+        best = None
+        for preferred_country in ["US", "GB", "IN", "AE"]:
+            matches = [p for p in pool if p["country"] == preferred_country]
+            if matches:
+                best = sorted(matches, key=lambda x: x["ad_count"], reverse=True)[0]
+                break
+
+        if not best:
+            best = sorted(pool, key=lambda x: x["ad_count"], reverse=True)[0]
+
+        result["found"] = True
+        result["best_match"] = best
+
+    except ImportError:
+        result["error"] = "GoogleAds library not installed. Run: pip install Google-Ads-Transparency-Scraper"
+    except Exception as e:
+        result["error"] = str(e)
+
+    return result
+
+if __name__ == "__main__":
+    query = sys.argv[1] if len(sys.argv) > 1 else ""
+    if query:
+        data = search_competitor(query)
+        print("RESPONDIQ_JSON:" + json.dumps(data))
+    else:
+        print("RESPONDIQ_JSON:" + json.dumps({"error": "No query provided", "found": False}))
+`;
+
+// ── Ensure the Python script file exists ──
+let scriptPath = null;
+
+function ensureScript() {
+  if (scriptPath && fs.existsSync(scriptPath)) return scriptPath;
+  scriptPath = path.join(__dirname, '_google_transparency_scraper.py');
+  fs.writeFileSync(scriptPath, PYTHON_SCRIPT);
+  return scriptPath;
 }
 
-// ══════════════════════════════════════════════════════════════
-// Core: Search for an advertiser by name/keyword
-// Returns suggestions with advertiser name, ID, country, ad count
-// ══════════════════════════════════════════════════════════════
-async function searchAdvertiser(query) {
-  const cacheKey = 'search:' + query.toLowerCase().trim();
-  const cached = cache.get(cacheKey);
-  if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
-    return cached.data;
-  }
+// ── Check if Python + GoogleAds library is available ──
+let pythonAvailable = null;
 
+function checkPythonSetup() {
+  if (pythonAvailable !== null) return pythonAvailable;
   try {
-    // The Transparency Center uses a protobuf-like format over HTTP
-    // The request body is form-encoded with a JSON-like nested structure
-    const requestBody = `f.req=${encodeURIComponent(JSON.stringify([[query, null, null, null, null, null, null, [20]]]))}&`;
-
-    const response = await fetch(SUGGEST_ENDPOINT, {
-      method: 'POST',
-      headers: getHeaders(),
-      body: requestBody,
-      signal: AbortSignal.timeout(15000),
+    execSync('python3 -c "from GoogleAds import GoogleAds; print(True)"', {
+      timeout: 10000, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe']
     });
-
-    if (!response.ok) {
-      // Fallback: try the simpler search approach
-      return await searchAdvertiserFallback(query);
-    }
-
-    const text = await response.text();
-    const suggestions = parseSuggestionResponse(text, query);
-
-    cache.set(cacheKey, { data: suggestions, timestamp: Date.now() });
-    return suggestions;
-
-  } catch (error) {
-    console.warn('[RespondIQ] Transparency direct search failed for', query, ':', error.message);
-    // Try fallback
-    return await searchAdvertiserFallback(query);
+    pythonAvailable = true;
+    console.log('[RespondIQ] Competitive Intel: Python + GoogleAds library available');
+  } catch (e) {
+    pythonAvailable = false;
+    console.warn('[RespondIQ] Competitive Intel: Python GoogleAds library NOT available. Install with: pip install Google-Ads-Transparency-Scraper');
   }
-}
-
-// ── Fallback: use the public-facing search URL and parse the response ──
-async function searchAdvertiserFallback(query) {
-  try {
-    const url = `${TRANSPARENCY_BASE}?text=${encodeURIComponent(query)}&region=anywhere`;
-    const response = await fetch(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (compatible; RespondIQ/2.0)',
-        'Accept': 'text/html',
-      },
-      signal: AbortSignal.timeout(10000),
-    });
-
-    if (!response.ok) return [];
-
-    const html = await response.text();
-
-    // Extract any advertiser data from the initial page state
-    // The Transparency Center embeds data in script tags
-    const dataMatch = html.match(/AF_initDataCallback\({[^}]*key:\s*'ds:1'[^}]*data:([\s\S]*?)\}\);/);
-    if (dataMatch) {
-      try {
-        const data = JSON.parse(dataMatch[1]);
-        return parseEmbeddedData(data, query);
-      } catch (e) { /* parsing failed, return empty */ }
-    }
-
-    return [];
-  } catch (error) {
-    console.warn('[RespondIQ] Transparency fallback also failed for', query);
-    return [];
-  }
-}
-
-// ── Parse the suggestion response from Google's internal API ──
-function parseSuggestionResponse(responseText, query) {
-  try {
-    // Google returns a weird format with )]}' prefix and nested arrays
-    let cleaned = responseText;
-    if (cleaned.startsWith(")]}'")) {
-      cleaned = cleaned.substring(4).trim();
-    }
-
-    // Try to parse as JSON
-    let data;
-    try {
-      data = JSON.parse(cleaned);
-    } catch (e) {
-      // Sometimes it's double-wrapped
-      const jsonMatch = cleaned.match(/\[[\s\S]*\]/);
-      if (jsonMatch) {
-        data = JSON.parse(jsonMatch[0]);
-      } else {
-        return [];
-      }
-    }
-
-    // Navigate the nested structure to find advertiser suggestions
-    const suggestions = [];
-    const extractFromArray = (arr) => {
-      if (!Array.isArray(arr)) return;
-      for (const item of arr) {
-        if (Array.isArray(item)) {
-          // Look for the pattern: [name, advertiserID, country, [null, [adCount, adCount]], verified]
-          if (typeof item[0] === 'string' && typeof item[1] === 'string' && item[1].startsWith('AR')) {
-            suggestions.push({
-              name: item[0],
-              advertiser_id: item[1],
-              country: item[2] || 'Unknown',
-              ad_count: (item[3] && item[3][1] && item[3][1][0]) ? parseInt(item[3][1][0]) : 0,
-              verified: !!item[4],
-            });
-          } else {
-            extractFromArray(item);
-          }
-        }
-      }
-    };
-
-    extractFromArray(data);
-    return suggestions;
-
-  } catch (error) {
-    return [];
-  }
-}
-
-function parseEmbeddedData(data, query) {
-  // Embedded data has a different structure, try to extract what we can
-  const suggestions = [];
-  try {
-    const extractRecursive = (obj) => {
-      if (Array.isArray(obj)) {
-        if (obj.length >= 3 && typeof obj[0] === 'string' && typeof obj[1] === 'string' && obj[1].startsWith('AR')) {
-          suggestions.push({
-            name: obj[0],
-            advertiser_id: obj[1],
-            country: obj[2] || 'Unknown',
-            ad_count: 0,
-            verified: false,
-          });
-        }
-        obj.forEach(extractRecursive);
-      } else if (obj && typeof obj === 'object') {
-        Object.values(obj).forEach(extractRecursive);
-      }
-    };
-    extractRecursive(data);
-  } catch (e) { /* ignore */ }
-  return suggestions;
+  return pythonAvailable;
 }
 
 // ══════════════════════════════════════════════════════════════
-// Pick the best match from suggestions
-// Prefers: US > GB > IN > highest ad count
+// Core: Call Python scraper for a single competitor
 // ══════════════════════════════════════════════════════════════
-function pickBestMatch(suggestions, query) {
-  if (!suggestions || suggestions.length === 0) return null;
+function scrapeOneCompetitor(query) {
+  const script = ensureScript();
+  try {
+    const output = execSync(
+      `python3 "${script}" "${query.replace(/"/g, '\\"')}"`,
+      { timeout: 20000, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }
+    );
 
-  // Filter out zero-ad entries
-  const withAds = suggestions.filter(s => s.ad_count > 0);
-  const pool = withAds.length > 0 ? withAds : suggestions;
-
-  // Priority: US, then GB, then by ad count
-  const priority = ['US', 'GB', 'IN', 'AE'];
-  for (const country of priority) {
-    const matches = pool.filter(s => s.country === country);
-    if (matches.length > 0) {
-      return matches.sort((a, b) => b.ad_count - a.ad_count)[0];
+    // Find our JSON marker in the output (Python lib may print junk before it)
+    const lines = output.split('\n');
+    for (const line of lines) {
+      if (line.startsWith('RESPONDIQ_JSON:')) {
+        return JSON.parse(line.substring('RESPONDIQ_JSON:'.length));
+      }
     }
-  }
 
-  // No priority country match, return highest ad count
-  return pool.sort((a, b) => b.ad_count - a.ad_count)[0];
+    return { query, found: false, error: 'No JSON marker in Python output' };
+  } catch (error) {
+    return { query, found: false, error: error.message?.substring(0, 200) || 'Python execution failed' };
+  }
 }
 
 // ══════════════════════════════════════════════════════════════
 // Main: Get competitive intelligence for multiple competitors
-// Returns structured data ready for prompt injection
 // ══════════════════════════════════════════════════════════════
 async function getCompetitiveIntelligence(competitorNames) {
-  if (!competitorNames || competitorNames.length === 0) return null;
+  if (!competitorNames || competitorNames.length === 0) return [];
+
+  // Check if Python setup is available
+  if (!checkPythonSetup()) {
+    console.warn('[RespondIQ] Skipping competitive intel (Python not configured)');
+    return competitorNames.map(name => ({
+      query: name.trim(),
+      found: false,
+      reason: 'Python GoogleAds library not installed on server',
+    }));
+  }
 
   const results = [];
 
@@ -215,60 +169,67 @@ async function getCompetitiveIntelligence(competitorNames) {
     const cleaned = name.trim();
     if (!cleaned) continue;
 
-    // Remove domain suffixes for search (google searches better by name)
+    // Remove domain suffixes for cleaner search
     const searchQuery = cleaned
       .replace(/\.(com|co\.uk|io|net|org|ai)$/i, '')
       .replace(/^https?:\/\//, '')
       .replace(/^www\./, '');
 
-    try {
-      const suggestions = await searchAdvertiser(searchQuery);
-      const best = pickBestMatch(suggestions, searchQuery);
-
-      if (best && best.ad_count > 0) {
-        const activityLevel = best.ad_count > 500 ? 'Very High' :
-                              best.ad_count > 100 ? 'High' :
-                              best.ad_count > 30 ? 'Moderate' :
-                              best.ad_count > 10 ? 'Active' :
-                              best.ad_count > 0 ? 'Low' : 'None Detected';
-
-        // Estimate channels from ad volume
-        const channels = ['Google Search'];
-        if (best.ad_count > 20) channels.push('Google Display Network');
-        if (best.ad_count > 50) channels.push('YouTube');
-
-        results.push({
-          query: cleaned,
-          found: true,
-          name: best.name,
-          advertiser_id: best.advertiser_id,
-          country: best.country,
-          ad_count: best.ad_count,
-          verified: best.verified,
-          activity_level: activityLevel,
-          estimated_channels: channels,
-          transparency_url: `https://adstransparency.google.com/advertiser/${best.advertiser_id}`,
-          all_suggestions_count: suggestions.length,
-        });
-      } else {
-        results.push({
-          query: cleaned,
-          found: false,
-          reason: suggestions.length > 0 ? 'Found entries but no active ads' : 'Not found in Google Ads Transparency Center',
-        });
-      }
-    } catch (error) {
-      console.error('[RespondIQ] Competitive intel failed for', cleaned, ':', error.message);
-      results.push({
-        query: cleaned,
-        found: false,
-        reason: error.message,
-      });
+    // Check cache
+    const cacheKey = 'ci:' + searchQuery.toLowerCase();
+    const cached = cache.get(cacheKey);
+    if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
+      results.push(cached.data);
+      continue;
     }
 
-    // Rate limit between requests
+    // Call Python scraper
+    console.log('[RespondIQ] Querying Google Ads Transparency for:', searchQuery);
+    const raw = scrapeOneCompetitor(searchQuery);
+
+    let structured;
+    if (raw.found && raw.best_match) {
+      const match = raw.best_match;
+      const adCount = match.ad_count || 0;
+
+      const activityLevel = adCount > 500 ? 'Very High' :
+                            adCount > 100 ? 'High' :
+                            adCount > 30 ? 'Moderate' :
+                            adCount > 10 ? 'Active' :
+                            adCount > 0 ? 'Low' : 'None Detected';
+
+      const channels = ['Google Search'];
+      if (adCount > 20) channels.push('Google Display Network');
+      if (adCount > 50) channels.push('YouTube');
+
+      structured = {
+        query: cleaned,
+        found: true,
+        name: match.name,
+        advertiser_id: match.advertiser_id,
+        country: match.country,
+        ad_count: adCount,
+        verified: match.verified,
+        activity_level: activityLevel,
+        estimated_channels: channels,
+        transparency_url: `https://adstransparency.google.com/advertiser/${match.advertiser_id}`,
+      };
+      console.log('[RespondIQ] Found:', match.name, '|', adCount, 'ads |', match.country);
+    } else {
+      structured = {
+        query: cleaned,
+        found: false,
+        reason: raw.error || 'Not found in Google Ads Transparency Center',
+      };
+      console.log('[RespondIQ] Not found:', cleaned, '|', raw.error || 'no results');
+    }
+
+    cache.set(cacheKey, { data: structured, timestamp: Date.now() });
+    results.push(structured);
+
+    // Rate limit between Python calls
     if (competitorNames.indexOf(name) < competitorNames.length - 1) {
-      await new Promise(r => setTimeout(r, 800));
+      await new Promise(r => setTimeout(r, 500));
     }
   }
 
@@ -277,7 +238,6 @@ async function getCompetitiveIntelligence(competitorNames) {
 
 // ══════════════════════════════════════════════════════════════
 // Build the prompt injection block for the AI model
-// This is what gets inserted into the RespondIQ prompt
 // ══════════════════════════════════════════════════════════════
 function buildCompetitorPromptBlock(results) {
   if (!results || results.length === 0) return '';
