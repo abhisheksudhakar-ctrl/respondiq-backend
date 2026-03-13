@@ -143,6 +143,8 @@ async function getKeywordIdeas(seedKeywords, pageUrl, locationStr, languageId) {
 
   const url = `https://googleads.googleapis.com/${API_VERSION}/customers/${customerId}:generateKeywordIdeas`;
   console.log('[RespondIQ] Calling Keyword Planner REST API | geo:', geoTargetId, '| seeds:', seedKeywords?.join(', ') || 'none');
+  console.log('[RespondIQ] KW API URL:', url);
+  console.log('[RespondIQ] KW login-customer-id:', loginCustomerId, '| customer_id:', customerId);
 
   const response = await fetch(url, {
     method: 'POST',
@@ -157,8 +159,8 @@ async function getKeywordIdeas(seedKeywords, pageUrl, locationStr, languageId) {
 
   if (!response.ok) {
     const errBody = await response.text();
-    console.error('[RespondIQ] Keyword Planner API error:', response.status, errBody);
-    throw new Error(`Keyword Planner API ${response.status}: ${errBody.substring(0, 300)}`);
+    console.error('[RespondIQ] Keyword Planner API FULL error:', response.status, errBody);
+    throw new Error(`Keyword Planner API ${response.status}: ${errBody.substring(0, 500)}`);
   }
 
   const data = await response.json();
