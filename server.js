@@ -175,7 +175,7 @@ Return ONLY a JSON array of company names, nothing else. Example: ["Company A","
       model: 'gemini-3.1-pro-preview',
       contents: [{ role: 'user', parts: [{ text: prompt }] }],
       config: {
-        maxOutputTokens: 256
+        maxOutputTokens: 1024
       }
     });
 
