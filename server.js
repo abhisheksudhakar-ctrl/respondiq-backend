@@ -176,8 +176,7 @@ Return ONLY a JSON array of company names, nothing else. Example: ["Company A","
       contents: [{ role: 'user', parts: [{ text: prompt }] }],
       config: {
         tools: [{ googleSearch: {} }],
-        maxOutputTokens: 256,
-        thinkingConfig: { thinkingLevel: 'none' }
+        maxOutputTokens: 256
       }
     });
 
