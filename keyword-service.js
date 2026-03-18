@@ -166,17 +166,27 @@ async function getKeywordIdeas(seedKeywords, pageUrl, locationStr, languageId) {
   const data = await response.json();
   const results = data.results || [];
 
-  const ideas = results.map(result => ({
-    keyword: result.text || '',
-    avg_monthly_searches: result.keywordIdeaMetrics?.avgMonthlySearches
-      ? parseInt(result.keywordIdeaMetrics.avgMonthlySearches, 10) : 0,
-    competition: result.keywordIdeaMetrics?.competition || 'UNSPECIFIED',
-    competition_index: result.keywordIdeaMetrics?.competitionIndex || 0,
-    low_top_of_page_bid_micros: result.keywordIdeaMetrics?.lowTopOfPageBidMicros
-      ? parseInt(result.keywordIdeaMetrics.lowTopOfPageBidMicros, 10) : 0,
-    high_top_of_page_bid_micros: result.keywordIdeaMetrics?.highTopOfPageBidMicros
-      ? parseInt(result.keywordIdeaMetrics.highTopOfPageBidMicros, 10) : 0,
-  }))
+  const ideas = results.map(result => {
+    const lowMicros = result.keywordIdeaMetrics?.lowTopOfPageBidMicros
+      ? parseInt(result.keywordIdeaMetrics.lowTopOfPageBidMicros, 10) : 0;
+    const highMicros = result.keywordIdeaMetrics?.highTopOfPageBidMicros
+      ? parseInt(result.keywordIdeaMetrics.highTopOfPageBidMicros, 10) : 0;
+    // Google Ads API returns CPC bids in micros (1 dollar = 1,000,000 micros)
+    const lowDollars = lowMicros / 1_000_000;
+    const highDollars = highMicros / 1_000_000;
+    return {
+      keyword: result.text || '',
+      avg_monthly_searches: result.keywordIdeaMetrics?.avgMonthlySearches
+        ? parseInt(result.keywordIdeaMetrics.avgMonthlySearches, 10) : 0,
+      competition: result.keywordIdeaMetrics?.competition || 'UNSPECIFIED',
+      competition_index: result.keywordIdeaMetrics?.competitionIndex || 0,
+      low_top_of_page_bid_micros: lowMicros,
+      high_top_of_page_bid_micros: highMicros,
+      // Pre-formatted dollar values for frontend display
+      low_cpc: '$' + lowDollars.toFixed(2),
+      high_cpc: '$' + highDollars.toFixed(2),
+    };
+  })
     .filter(kw => kw.avg_monthly_searches > 0)
     .sort((a, b) => b.avg_monthly_searches - a.avg_monthly_searches)
     .slice(0, 30);
