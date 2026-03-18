@@ -340,6 +340,22 @@ function buildBenchmarkPromptBlock(industryString) {
     block += `\nSEASONALITY: ${data.seasonal_notes}\n`;
   }
 
+  block += `\nFOR CHANNELS NOT IN THE BASELINE ABOVE (DSPs, CTV/OTT, Programmatic Display/Video/Native/Audio/DOOH, `;
+  block += `TikTok, Reddit, Amazon Ads, Snapchat, Pinterest, X/Twitter, Spotify, and any other platform `;
+  block += `not listed in the baseline rates table):\n`;
+  block += `  - Use your Search grounding capability to look up current benchmark rates BEFORE assigning `;
+  block += `any CPM, CPC, or CTR figure for these channels.\n`;
+  block += `  - Search specifically for: "[platform] average CPM 2025 2026", "[platform] advertising `;
+  block += `benchmark [industry]", "IAB programmatic CPM benchmark 2025", "eMarketer CTV CPM 2025", `;
+  block += `"Basis Technologies programmatic benchmark report", "[DSP name] media kit rates".\n`;
+  block += `  - Label all rates sourced this way as "search-verified estimate" in the plan output — `;
+  block += `never present them with the same confidence as the verified baseline rates above.\n`;
+  block += `  - If Search returns a range, use the midpoint and note the range in parentheses.\n`;
+  block += `  - If Search returns no usable result, state the rate as "market rate — verify with platform" `;
+  block += `rather than inventing a number from training memory.\n`;
+  block += `  - This applies especially to programmatic channels where rates vary significantly by `;
+  block += `deal type: open auction CPMs differ from PMP and programmatic direct — specify which.\n\n`;
+
   block += `\nCONSISTENCY REQUIREMENT: Whatever rates you choose for a channel, use the SAME rates `;
   block += `consistently across ALL sections of this plan (Section 05 budget, Section 09 channel detail, `;
   block += `Section 16 benchmarks). Do not use $${BENCHMARKS[key].channels.google_search?.cpc} CPC in `;
