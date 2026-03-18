@@ -546,7 +546,7 @@ app.post('/api/keyword-ideas', async (req, res) => {
       return res.json({ keywords: [], fallback: true, reason: 'not_configured' });
     }
 
-    const { seedKeywords, pageUrl, location, languageId } = req.body;
+    const { seedKeywords, pageUrl, location, languageId, maxKeywords } = req.body;
 
     if (!seedKeywords?.length && !pageUrl) {
       return res.status(400).json({ error: 'Provide seedKeywords array or pageUrl' });
@@ -556,14 +556,16 @@ app.post('/api/keyword-ideas', async (req, res) => {
 
     const ideas = await getKeywordIdeas(seedKeywords, pageUrl, location, languageId);
 
-    // Convert micros to dollars for readability
-    const formatted = ideas.map(kw => ({
+    // keyword-service.js now provides pre-formatted low_cpc/high_cpc strings
+    // with the correct micros-to-dollars conversion (÷ 1,000,000)
+    const limit = Math.min(Math.max(parseInt(maxKeywords, 10) || 10, 1), 30);
+    const formatted = ideas.slice(0, limit).map(kw => ({
       keyword: kw.keyword,
       avg_monthly_searches: kw.avg_monthly_searches,
       competition: kw.competition,
       competition_index: kw.competition_index,
-      low_cpc: '$' + (kw.low_top_of_page_bid_micros / 1_000_000).toFixed(2),
-      high_cpc: '$' + (kw.high_top_of_page_bid_micros / 1_000_000).toFixed(2),
+      low_cpc: kw.low_cpc || ('$' + (kw.low_top_of_page_bid_micros / 1_000_000).toFixed(2)),
+      high_cpc: kw.high_cpc || ('$' + (kw.high_top_of_page_bid_micros / 1_000_000).toFixed(2)),
     }));
 
     console.log('[RespondIQ] Returning', formatted.length, 'keyword ideas');
