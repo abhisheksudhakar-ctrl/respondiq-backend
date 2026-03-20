@@ -1,7 +1,7 @@
 {
   "name": "respondiq-backend",
-  "version": "12.4.0",
-  "description": "RespondIQ v12.4 — Gemini 3.1 Pro (MEDIUM thinking + Search Grounding) + Email/Webhook Proxy + Benchmark Anchors (Render.com)",
+  "version": "12.6.0",
+  "description": "RespondIQ v12.6 — Gemini 3.1 Pro (MEDIUM thinking + Search Grounding) + Server-Side Prompts + SSRF Protection + Benchmark Anchors (Render.com)",
   "private": true,
   "scripts": {
     "start": "node server.js",
