@@ -461,24 +461,23 @@ async function detectActualIndustry(brandName, formIndustry, websiteText) {
       .map(([k, v]) => `  "${k}" = ${v.label}`)
       .join('\n');
 
-    const prompt = `You are an industry classification expert. Determine the ACTUAL industry for the brand "${brandName}".
+    const validKeys = Object.keys(BENCHMARKS);
 
-The user selected: "${formIndustry}"
+    const prompt = `Classify the brand "${brandName}" into an industry.
+User selected: "${formIndustry}"
+${websiteText ? `Website excerpt: ${websiteText.substring(0, 1500)}` : 'No website content. Use brand name and your knowledge.'}
 
-${websiteText ? `Website content:\n${websiteText.substring(0, 2000)}` : 'No website content available. Use the brand name and your knowledge to classify.'}
-
-VALID INDUSTRY KEYS (pick exactly one):
+VALID KEYS:
 ${validIndustries}
-  "default" = General / Cross-Industry (use ONLY if no other key fits)
+  "default" = General / Cross-Industry
 
-RULES:
-- Base your decision on what the brand ACTUALLY does, not what the user selected.
-- If the brand is a car wash, auto repair shop, dealership, or similar, use "automotive".
-- If the brand is a local service provider (plumber, HVAC, etc.), use "home_services".
-- If the user's selection is correct, return that same key.
-- Return ONLY a JSON object, nothing else.
+Classification rules:
+- Car wash, auto repair, dealership = "automotive"
+- Local services (plumber, HVAC) = "home_services"
+- If user selection is correct, return that key with corrected=false
+- If user selection is wrong, return the correct key with corrected=true
 
-Return: {"industry_key": "the_key", "industry_label": "Human Readable Label", "corrected": true/false, "reason": "one sentence explanation"}`;
+Respond with ONLY the JSON object. No explanation, no markdown.`;
 
     console.log('[RespondIQ] Detecting actual industry for:', brandName, '| form said:', formIndustry);
 
@@ -486,19 +485,32 @@ Return: {"industry_key": "the_key", "industry_label": "Human Readable Label", "c
       model: 'gemini-3.1-pro-preview',
       contents: [{ role: 'user', parts: [{ text: prompt }] }],
       config: {
-        maxOutputTokens: 512,
-        tools: [{ googleSearch: {} }],
+        maxOutputTokens: 256,
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: 'object',
+          properties: {
+            industry_key: { type: 'string' },
+            industry_label: { type: 'string' },
+            corrected: { type: 'boolean' },
+            reason: { type: 'string' }
+          },
+          required: ['industry_key', 'industry_label', 'corrected', 'reason']
+        }
+        // NOTE: No googleSearch tool here. Classification does not need live search.
       }
     });
 
     const text = response.text || '';
+    // With responseMimeType: 'application/json', the response should be clean JSON.
+    // But we still attempt regex extraction as a safety net.
     const match = text.match(/\{[\s\S]*?\}/);
     if (match) {
       const result = JSON.parse(match[0]);
       // Validate the returned key exists in our benchmark database
       if (result.industry_key && BENCHMARKS[result.industry_key]) {
         console.log('[RespondIQ] Industry detection result:',
-          result.corrected ? `CORRECTED "${formIndustry}" → "${result.industry_label}"` : `CONFIRMED "${formIndustry}"`,
+          result.corrected ? `CORRECTED "${formIndustry}" -> "${result.industry_label}"` : `CONFIRMED "${formIndustry}"`,
           '| reason:', result.reason || 'n/a');
         return {
           key: result.industry_key,
@@ -510,7 +522,23 @@ Return: {"industry_key": "the_key", "industry_label": "Human Readable Label", "c
       }
     }
 
-    console.warn('[RespondIQ] Industry detection: could not parse response, using form value');
+    // Fallback: try to parse the entire response as JSON directly
+    try {
+      const directParse = JSON.parse(text.trim());
+      if (directParse.industry_key && BENCHMARKS[directParse.industry_key]) {
+        console.log('[RespondIQ] Industry detection (direct parse):',
+          directParse.corrected ? `CORRECTED "${formIndustry}" -> "${directParse.industry_label}"` : `CONFIRMED "${formIndustry}"`);
+        return {
+          key: directParse.industry_key,
+          label: directParse.industry_label || BENCHMARKS[directParse.industry_key].label,
+          corrected: !!directParse.corrected,
+          reason: directParse.reason || '',
+          formIndustry: formIndustry,
+        };
+      }
+    } catch (e) { /* direct parse failed, fall through */ }
+
+    console.warn('[RespondIQ] Industry detection: could not parse response, using form value. Raw:', text.substring(0, 300));
     return null;
   } catch (err) {
     console.warn('[RespondIQ] Industry detection failed (graceful):', err.message);
@@ -526,16 +554,16 @@ Return: {"industry_key": "the_key", "industry_label": "Human Readable Label", "c
 async function identifyCompetitors(brandName, industry, companySize, websiteText) {
   try {
     const ai = getGeminiClient();
-    const prompt = `You are a competitive analyst. Identify 3-5 REAL companies that are direct competitors to "${brandName}" in the ${industry} industry.
+    const prompt = `Identify 3-5 REAL companies that directly compete with "${brandName}" in the ${industry} industry.
 
-IMPORTANT RULES:
+Rules:
 - ${brandName} is a ${companySize} company. Match competitors by SIMILAR size.
 - Do NOT pick Fortune 500 giants unless ${brandName} is also a large enterprise.
 - Every name must be a real, existing company (not fictional).
 - Pick companies that ${brandName} would actually compete against for the same customers.
-${websiteText ? `\nContext from their website:\n${websiteText.substring(0, 1500)}` : ''}
+${websiteText ? `\nWebsite context:\n${websiteText.substring(0, 1500)}` : ''}
 
-Return ONLY a JSON array of company names, nothing else. Example: ["Company A","Company B","Company C"]`;
+Respond with ONLY a JSON array of company name strings. No explanation, no markdown, no numbered lists.`;
 
     console.log('[RespondIQ] Auto-identifying competitors for:', brandName);
 
@@ -543,20 +571,65 @@ Return ONLY a JSON array of company names, nothing else. Example: ["Company A","
       model: 'gemini-3.1-pro-preview',
       contents: [{ role: 'user', parts: [{ text: prompt }] }],
       config: {
-        maxOutputTokens: 1024
+        maxOutputTokens: 512,
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: 'array',
+          items: { type: 'string' }
+        }
       }
     });
 
     const text = response.text || '';
-    const match = text.match(/\[[\s\S]*?\]/);
-    if (match) {
-      const names = JSON.parse(match[0]);
-      if (Array.isArray(names) && names.length > 0) {
-        console.log('[RespondIQ] Auto-identified competitors:', names.join(', '));
-        return names.slice(0, 5);
+
+    // Attempt 1: Parse as clean JSON array (expected path with responseMimeType)
+    try {
+      const directParse = JSON.parse(text.trim());
+      if (Array.isArray(directParse) && directParse.length > 0) {
+        const names = directParse.filter(n => typeof n === 'string' && n.trim().length > 0).slice(0, 5);
+        if (names.length > 0) {
+          console.log('[RespondIQ] Auto-identified competitors (direct):', names.join(', '));
+          return names;
+        }
+      }
+    } catch (e) { /* direct parse failed, try regex */ }
+
+    // Attempt 2: Regex extraction of JSON array from within conversational text
+    const arrayMatch = text.match(/\[[\s\S]*?\]/);
+    if (arrayMatch) {
+      try {
+        const names = JSON.parse(arrayMatch[0]);
+        if (Array.isArray(names) && names.length > 0) {
+          const cleaned = names.filter(n => typeof n === 'string' && n.trim().length > 0).slice(0, 5);
+          if (cleaned.length > 0) {
+            console.log('[RespondIQ] Auto-identified competitors (regex):', cleaned.join(', '));
+            return cleaned;
+          }
+        }
+      } catch (e) { /* JSON array regex failed, try conversational fallback */ }
+    }
+
+    // Attempt 3: Conversational fallback parser
+    // Handles cases where the LLM outputs numbered lists or prose like:
+    //   "1. Breeze Thru Car Wash\n2. Cobblestone Auto Spa\n3. ..."
+    //   "Here are competitors: Breeze Thru Car Wash, Cobblestone Auto Spa, ..."
+    const numberedListNames = [];
+    const numberedRegex = /^\s*\d+[\.\)]\s*\*{0,2}(.+?)(?:\*{0,2})\s*(?:[:\-].*)?$/gm;
+    let listMatch;
+    while ((listMatch = numberedRegex.exec(text)) !== null) {
+      const name = listMatch[1].replace(/\*+/g, '').replace(/["']/g, '').trim();
+      if (name.length > 1 && name.length < 80) {
+        numberedListNames.push(name);
       }
     }
-    console.warn('[RespondIQ] Could not parse competitor names from:', text.substring(0, 200));
+
+    if (numberedListNames.length >= 2) {
+      const recovered = numberedListNames.slice(0, 5);
+      console.log('[RespondIQ] Auto-identified competitors (conversational fallback):', recovered.join(', '));
+      return recovered;
+    }
+
+    console.warn('[RespondIQ] Could not parse competitor names from:', text.substring(0, 300));
     return [];
   } catch (err) {
     console.warn('[RespondIQ] identifyCompetitors failed (graceful):', err.message);
