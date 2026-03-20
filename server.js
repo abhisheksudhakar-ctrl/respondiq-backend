@@ -43,76 +43,367 @@ function getGeminiClient() {
   return new GoogleGenAI({ apiKey: key });
 }
 
+// ══════════════════════════════════════════════════════════════
+// PRIORITY 1: SSRF VALIDATION
+// Rejects private IPs, metadata endpoints, non-standard ports
+// ══════════════════════════════════════════════════════════════
+const { URL } = require('url');
+const dns = require('dns');
+const { promisify } = require('util');
+const dnsLookup = promisify(dns.lookup);
+
+function isPrivateIP(ip) {
+  // IPv4 private/reserved ranges
+  if (/^127\./.test(ip)) return true;                      // loopback
+  if (/^10\./.test(ip)) return true;                       // Class A private
+  if (/^172\.(1[6-9]|2\d|3[01])\./.test(ip)) return true;  // Class B private
+  if (/^192\.168\./.test(ip)) return true;                  // Class C private
+  if (/^169\.254\./.test(ip)) return true;                  // link-local / AWS metadata
+  if (/^100\.100\.100\.200/.test(ip)) return true;          // Alibaba/cloud metadata
+  if (ip === '0.0.0.0') return true;
+  if (ip === '::1' || ip === '::') return true;             // IPv6 loopback
+  return false;
+}
+
+async function validateUrl(rawUrl) {
+  let parsed;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    return { valid: false, reason: 'Invalid URL format' };
+  }
+
+  // Protocol check: only http/https
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    return { valid: false, reason: 'Only http and https protocols are allowed' };
+  }
+
+  // Reject non-standard ports
+  if (parsed.port && parsed.port !== '80' && parsed.port !== '443') {
+    return { valid: false, reason: 'Non-standard ports are not allowed' };
+  }
+
+  // Reject obvious private hostnames
+  const hostname = parsed.hostname.toLowerCase();
+  if (hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '0.0.0.0' || hostname === '[::1]') {
+    return { valid: false, reason: 'Requests to localhost/loopback are not allowed' };
+  }
+
+  // DNS resolution check: reject if it resolves to a private IP
+  try {
+    const { address } = await dnsLookup(parsed.hostname);
+    if (isPrivateIP(address)) {
+      return { valid: false, reason: 'URL resolves to a private/reserved IP range' };
+    }
+  } catch {
+    return { valid: false, reason: 'Could not resolve hostname' };
+  }
+
+  return { valid: true, url: parsed.href };
+}
+
+
+// ══════════════════════════════════════════════════════════════
+// PRIORITY 2: SERVER-SIDE PROMPT BUILDER
+// All proprietary rules and logic assembled here, not on the client
+// ══════════════════════════════════════════════════════════════
+
+const BUDGET_MAP = {
+  '$1,000 - $5,000': { low: 1000, high: 5000, mid: 3000 },
+  '$5,000 - $10,000': { low: 5000, high: 10000, mid: 7500 },
+  '$10,000 - $25,000': { low: 10000, high: 25000, mid: 17500 },
+  '$25,000 - $50,000': { low: 25000, high: 50000, mid: 37500 },
+  '$50,000 - $100,000': { low: 50000, high: 100000, mid: 75000 },
+  '$100,000 - $250,000': { low: 100000, high: 250000, mid: 175000 },
+  '$250,000 - $500,000': { low: 250000, high: 500000, mid: 375000 },
+  '$500,000 - $1,000,000': { low: 500000, high: 1000000, mid: 750000 },
+  '$1,000,000+': { low: 1000000, high: 2000000, mid: 1500000 }
+};
+
+const DURATION_MONTHS = {
+  '4 Weeks': 1, '8 Weeks': 2, '12 Weeks (Quarter)': 3, '6 Months': 6, '12 Months (Annual)': 12
+};
+
+const FUNNEL_GUIDE = {
+  'Sales & Conversions': 'Funnel split: 20% awareness, 30% consideration, 50% conversion. Heavy on search, retargeting, shopping ads. Optimize for ROAS and CPA.',
+  'Leads & Signups': 'Funnel split: 25% awareness, 40% consideration, 35% conversion. Focus on lead gen forms, landing pages, search + social lead ads. Optimize for CPL.',
+  'Brand Awareness': 'Funnel split: 60% awareness, 30% consideration, 10% conversion. Heavy on video, CTV, display, social reach campaigns. Optimize for reach, frequency, brand lift.',
+  'Website Traffic': 'Funnel split: 30% awareness, 45% consideration, 25% conversion. Focus on search, social clicks, native, display. Optimize for CPC and session quality.',
+  'App Installs': 'Funnel split: 25% awareness, 35% consideration, 40% conversion. Focus on mobile-first channels, app install campaigns, deep linking. Optimize for CPI.',
+  'Store Visits / Foot Traffic': 'Funnel split: 35% awareness, 35% consideration, 30% conversion. Focus on local search, geo-targeted display, DOOH, social with store visit optimization. Optimize for cost per store visit.',
+  'Product Launch': 'Funnel split: 50% awareness, 35% consideration, 15% conversion. Phase 1 (teaser/hype), Phase 2 (launch blitz), Phase 3 (sustain). Heavy video + social + PR.',
+  'Market Expansion': 'Funnel split: 45% awareness, 35% consideration, 20% conversion. Focus on new geo/demo targeting, brand building in new markets, competitive conquest.',
+  'Customer Retention': 'Funnel split: 15% awareness, 25% consideration, 60% conversion. Focus on email, retargeting, loyalty programs, CRM-based audiences. Optimize for LTV and churn rate.',
+  'Event Promotion': 'Funnel split: 40% awareness, 40% consideration, 20% conversion. Time-sensitive, heavy first 60% of timeline, countdown urgency. Focus on social, search, email, geo-targeted.'
+};
+
+function buildSystemPrompt(data) {
+  return `You are a senior media planner at a top agency preparing a real client deliverable. You must return ONLY valid JSON, no markdown, no code fences, no explanation text.
+
+ABSOLUTE RULES YOU CANNOT BREAK:
+1. Every competitor must be a REAL brand that is a genuine competitive peer, matched by service type, company scale, and target market. NEVER pick giant corporations unless the client is also a giant corporation. NEVER use placeholders like "Competitor A" or "Brand X".
+2. Every CPM/CPC must be a specific dollar amount (never "Varies" or "Projected")
+3. Every impression number must be calculated from (budget / CPM * 1000)
+4. All budget percentages must sum to exactly 100%
+5. The total of all channel impressions must approximately equal projected_impressions
+6. Flight plan entries must describe real tactical actions, not symbols or dots
+7. Channel tactics must be specific and actionable, not generic
+8. KPI targets must be realistic numbers based on industry benchmarks for ${data.industry}
+9. If website content is provided, READ IT CAREFULLY to understand what the business actually does before selecting competitors. The website content is the #1 source of truth for competitor matching.
+10. For every CPM, CPC, CTR, and industry benchmark figure, you MUST use your search capability to look up current rates before writing any number. Search for "[industry] average CPM 2025", "[channel] advertising benchmark [industry] 2025", "average CPC [channel] [industry]", and equivalent queries. Use ONLY search-verified rates, never use memorised training data for cost figures. If search returns a range, use the midpoint. Every benchmark in the benchmarks array must reference a figure you verified via search, not estimated from memory.`;
+}
+
+function buildUserPrompt(data, bInfo, months, totalBudgetLow, totalBudgetHigh, totalBudgetMid, keywordData, competitorIntelBlock) {
+  const funnelAdvice = FUNNEL_GUIDE[data.goal] || FUNNEL_GUIDE['Sales & Conversions'];
+
+  const competitorInstruction = data.competitors
+    ? `The client has identified these key competitors: ${data.competitors}. Use these EXACT competitor names in your analysis. For each competitor, describe their actual known advertising approach, what platforms they advertise on, their messaging themes, their estimated market share, and their competitive strengths. Research what their ads look like on Google Ads Transparency Center, Meta Ad Library, and LinkedIn Ads.`
+    : `You MUST identify 3-5 REAL competitor brands that are ACTUAL competitive peers of ${data.brandName}. This is critical, follow these rules:
+
+COMPETITOR MATCHING RULES:
+1. MATCH BY SERVICE/PRODUCT TYPE: If ${data.brandName} offers specific services (e.g., ad operations, programmatic management), find competitors offering the SAME specific services, not just companies in the same broad industry.
+2. MATCH BY COMPANY SCALE: ${data.brandName} is a ${data.companySize} company. Find competitors of SIMILAR size. Do NOT compare a small/mid-size company to Fortune 500 giants like Deloitte, Accenture, McKinsey, WPP, etc. unless ${data.brandName} is itself a large enterprise.
+3. MATCH BY TARGET MARKET: Find competitors that go after the SAME types of clients/customers in the same regions.
+4. MATCH BY COMPETITIVE OVERLAP: These should be companies that ${data.brandName} actually loses deals to, or competes against in RFPs and pitches.
+
+EXAMPLES OF GOOD vs BAD matching:
+- If brand is a small paid media agency: GOOD: MediaMint, Theorem, Jellyfish, Brainlabs. BAD: Accenture, Deloitte, WPP.
+- If brand is a local bakery: GOOD: other local bakeries, regional chains. BAD: Hostess, Bimbo, Pillsbury.
+- If brand is a mid-market SaaS: GOOD: similar-sized SaaS competitors. BAD: Salesforce, Oracle, SAP.
+
+The website content (if provided below) will tell you EXACTLY what ${data.brandName} does. Use it to identify precise competitive peers. Every competitor must be a real, named company that actually exists.`;
+
+  // Build the flight plan key instruction based on duration
+  let flightKeyInstruction;
+  if (months === 1) {
+    flightKeyInstruction = `DURATION: 4 Weeks. Use WEEKLY keys.
+    Each flight_plan object must have: "channel", "wk1", "wk2", "wk3", "wk4"
+    Phase guidance: wk1 = "Launch", wk2 = "Optimize", wk3 = "Scale", wk4 = "Close"`;
+  } else if (months === 2) {
+    flightKeyInstruction = `DURATION: 8 Weeks. Use BI-WEEKLY keys.
+    Each flight_plan object must have: "channel", "wk1_2", "wk3_4", "wk5_6", "wk7_8"`;
+  } else if (months === 3) {
+    flightKeyInstruction = `DURATION: 12 Weeks (Quarter). Use 3-WEEK keys.
+    Each flight_plan object must have: "channel", "wk1_3", "wk4_6", "wk7_9", "wk10_12"`;
+  } else if (months === 6) {
+    flightKeyInstruction = `DURATION: 6 Months. Use CONSOLIDATED MONTHLY keys.
+    Each flight_plan object must have: "channel", "month_1", "month_2_3", "month_4_5", "month_6"`;
+  } else {
+    flightKeyInstruction = `DURATION: 12 Months (Annual). Use QUARTERLY keys.
+    Each flight_plan object must have: "channel", "q1", "q2", "q3", "q4"`;
+  }
+
+  // Build the flight plan JSON key template for the schema
+  let flightPlanKeysTemplate;
+  if (months === 1) flightPlanKeysTemplate = '"wk1":"Launch: specific actions","wk2":"Optimize: specific actions","wk3":"Scale: specific actions","wk4":"Close: specific actions"';
+  else if (months === 2) flightPlanKeysTemplate = '"wk1_2":"Launch: specific actions","wk3_4":"Optimize: specific actions","wk5_6":"Scale: specific actions","wk7_8":"Close: specific actions"';
+  else if (months === 3) flightPlanKeysTemplate = '"wk1_3":"Launch: specific actions","wk4_6":"Optimize: specific actions","wk7_9":"Scale: specific actions","wk10_12":"Close: specific actions"';
+  else if (months === 6) flightPlanKeysTemplate = '"month_1":"Launch: specific actions","month_2_3":"Optimize: specific actions","month_4_5":"Scale: specific actions","month_6":"Close: specific actions"';
+  else flightPlanKeysTemplate = '"q1":"Launch: setup, testing, initial campaigns","q2":"Optimize: refine targeting, creative refresh, scale winners","q3":"Scale: expand reach, new audiences, increase budget on top performers","q4":"Close: final push, retargeting, reporting, transition planning"';
+
+  // Goal-specific KPI alignment
+  let goalKpiBlock;
+  if (data.goal === 'Leads & Signups') {
+    goalKpiBlock = '- Do NOT show ROAS in the executive summary or KPI targets, leads-focused campaigns track CPL (Cost Per Lead), CPA, and Conversion Rate, not ROAS. ROAS requires revenue data which lead gen campaigns typically lack.\n- Focus KPIs on: CPL, form fill rate, lead quality score, lead-to-MQL conversion rate.';
+  } else if (data.goal === 'Brand Awareness') {
+    goalKpiBlock = '- Focus KPIs on: CPM, reach, frequency, brand lift, share of voice. Do NOT over-emphasize conversion metrics.\n- Budget should weight heavily toward upper-funnel channels.';
+  } else if (data.goal === 'Website Traffic') {
+    goalKpiBlock = '- Focus KPIs on: CPC, CTR, sessions, bounce rate, pages per session. Prioritize click-efficient channels.\n- Do NOT show ROAS unless the goal explicitly involves revenue.';
+  } else if (data.goal === 'App Installs') {
+    goalKpiBlock = '- Focus KPIs on: CPI (Cost Per Install), install rate, Day 1/7/30 retention. Prioritize mobile-first channels.';
+  } else {
+    goalKpiBlock = '- Align all KPI targets, channel selection, and budget allocation to the stated goal of ' + data.goal + '.';
+  }
+
+  // ROAS industry range for RULE 5
+  let roasRange = '2:1 to 6:1';
+  if (data.industry === 'E-commerce (DTC)' || data.industry === 'Retail') roasRange = '3:1 to 8:1';
+  else if (data.industry === 'B2B SaaS') roasRange = '2:1 to 5:1';
+
+  // Industry-specific CPC range for RULE 3
+  let industryCpcRange = '2.00-4.50';
+  if (data.industry === 'Financial Services' || data.industry === 'B2B SaaS') industryCpcRange = '4.00-8.00';
+  else if (data.industry === 'E-commerce (DTC)' || data.industry === 'Retail') industryCpcRange = '1.20-3.00';
+
+  let prompt = `You are a senior media strategist at a top-tier agency (like GroupM, Dentsu, or Publicis) preparing a real client media plan. This plan will be presented to the client. Every number must be realistic, defensible, and based on current industry data.
+
+=== CLIENT BRIEF ===
+Brand: ${data.brandName}
+Website: ${data.website}
+Industry: ${data.industry}
+Company Size: ${data.companySize}
+Campaign: ${data.campaignName}
+Duration: ${data.campaignDuration} (${months} months)
+Monthly Budget: ${data.budget} (range: $${bInfo.low.toLocaleString()}-$${bInfo.high.toLocaleString()}/mo)
+Total Campaign Budget: $${totalBudgetLow.toLocaleString()} - $${totalBudgetHigh.toLocaleString()} (use ~$${totalBudgetMid.toLocaleString()} as working number)
+Goal: ${data.goal}
+Primary KPI: ${data.kpi}
+Target Location: ${data.location}${data.locationList && data.locationList.length > 1 ? ' (multi-geo campaign targeting ' + data.locationList.length + ' markets: ' + data.locationList.join(', ') + ')' : ''}
+Target Age: ${data.ageRange}
+Target Gender: ${data.gender}
+Household Income: ${data.income}
+Selected Channels: ${data.platform}
+Creative Formats: ${data.creativeFormat}
+Known Competitors: ${data.competitors || 'Not specified, you must identify them based on the brand, website, industry, and company size'}
+${data.pastPerformance ? 'Past Campaign Performance: ' + data.pastPerformance : ''}
+${data.salesCycle ? 'Average Sales Cycle: ' + data.salesCycle : ''}
+${data.webTraffic ? 'Current Website Traffic: ' + data.webTraffic : ''}
+${data.crmTool ? 'CRM / Marketing Stack: ' + data.crmTool : ''}
+${data.creativeAssets ? 'Available Creative Assets: ' + data.creativeAssets : ''}
+Additional Context: ${data.notes || 'None'}
+
+CRITICAL CONTEXT FOR COMPETITOR IDENTIFICATION:
+- ${data.brandName} is a ${data.companySize} in the ${data.industry} space
+- Their website is ${data.website}, VISIT THIS MENTALLY to understand what they actually do
+- With a monthly ad budget of ${data.budget}, this suggests they are a ${bInfo.mid < 10000 ? 'small/emerging' : bInfo.mid < 50000 ? 'mid-market' : bInfo.mid < 250000 ? 'established mid-market' : 'large'} player
+- Competitors MUST be companies of similar scale that compete for the same customers
+- Do NOT default to Fortune 500 / Big 4 / household-name companies unless the brand itself is that size
+- Think: "Who would ${data.brandName} encounter in a competitive pitch or lose a deal to?"
+${data.salesCycle ? `\n=== CAMPAIGN INTELLIGENCE ===\nSales Cycle: ${data.salesCycle} - ${data.salesCycle === 'Same day' || data.salesCycle === '1-7 days' ? 'Short cycle = favor conversion-heavy, bottom-funnel channels (search, retargeting, shopping).' : data.salesCycle === '1-4 weeks' ? 'Medium cycle = balance consideration + conversion (search, social lead gen, email nurture).' : 'Long cycle = invest heavily in awareness + consideration + nurture (LinkedIn, content, display retargeting, email sequences). Expect leads to convert over multiple touchpoints.'}` : ''}
+${data.webTraffic ? `Website Traffic: ${data.webTraffic} - ${data.webTraffic === 'Under 1K visits' ? 'Very low traffic = prioritize prospecting channels over retargeting. Retargeting audience will be too small.' : data.webTraffic === '1K-10K visits' ? 'Low traffic = limit retargeting to 5-10% of budget. Focus on prospecting.' : data.webTraffic === '10K-50K visits' ? 'Moderate traffic = retargeting is viable at 10-15% of budget alongside prospecting.' : 'High traffic = strong retargeting potential at 15-20% of budget. Layer frequency-capped remarketing across channels.'}` : ''}
+${data.crmTool ? `CRM Stack: ${data.crmTool}, reference this in analytics_stack and attribution sections. Recommend integrations specific to ${data.crmTool}.` : ''}
+
+=== STRATEGIC FRAMEWORK ===
+${funnelAdvice}
+
+=== MANDATORY RULES, FOLLOW ALL OF THESE ===
+
+RULE 1, REAL COMPETITOR NAMES:
+${competitorInstruction}
+NEVER use generic names like "Competitor A" or "Brand X". Every competitor must be a real, recognizable company.
+
+RULE 2, BUDGET MATH MUST ADD UP:
+- total_investment should be ~$${totalBudgetMid.toLocaleString()} (the midpoint of the budget range x ${months} months)
+- All channel budget_pct values MUST add to exactly 100%
+- Each budget_breakdown item's pct must match its channel's budget_pct
+- Calculate each channel's dollar allocation: total_investment x (pct/100)
+- Then calculate impressions: (dollar allocation / CPM) x 1,000 for CPM channels, or (dollar allocation / CPC) for CPC channels
+- Show the math clearly in impressions field, e.g. "~2.4M (at $7.50 CPM)" or "~18K clicks (at $2.80 CPC)"
+
+RULE 3, USE THESE 2025-2026 INDUSTRY BENCHMARK RATES:
+Google Search: CPC $1.50-$5.00 (${data.industry} typically $${industryCpcRange})
+Google Display/GDN: CPM $2.50-$6.00
+Meta (Facebook): CPM $8.00-$14.00, CPC $0.60-$1.80
+Meta (Instagram): CPM $9.00-$16.00, CPC $0.70-$2.20
+TikTok: CPM $6.00-$10.00
+LinkedIn: CPM $28.00-$45.00, CPC $5.00-$12.00
+YouTube Pre-Roll: CPM $15.00-$30.00, CPV $0.02-$0.06
+CTV/OTT: CPM $25.00-$40.00
+Programmatic Display: CPM $3.00-$7.00
+Native Ads: CPM $5.00-$12.00
+Snapchat: CPM $5.00-$8.00
+Pinterest: CPM $4.00-$8.00
+Reddit: CPM $3.50-$6.50
+Podcast: CPM $18.00-$28.00
+DOOH: CPM $5.00-$12.00
+Spotify Audio: CPM $15.00-$25.00
+Pick a SPECIFIC number within the range (not the range itself). NEVER write "Varies" or "Projected" or "TBD".
+
+RULE 4, PROJECTED IMPRESSIONS MUST MATCH:
+The top-level "projected_impressions" must approximately equal the SUM of all individual channel impressions in budget_breakdown. Show this consistency.
+IMPORTANT: For CPC channels like Google Search, the top-level "projected_impressions" should show ACTUAL IMPRESSIONS (not clicks). Calculate: if you expect X clicks at Y% CTR, then impressions = clicks / CTR. Example: 1,000 clicks at 5% CTR = 20,000 impressions = "20.0K". Never label clicks as impressions.
+
+RULE 5, REALISTIC KPI TARGETS:
+Base KPI targets on the budget and industry benchmarks:
+- CTR: Search 3-8%, Display 0.3-0.8%, Social 0.8-2.5%, Video 0.5-1.5%
+- CPC: Derive from benchmark rates above
+- CPA: Industry ${data.industry} average, adjusted for funnel stage
+- ROAS: ${roasRange} for ${data.industry}
+- Conversion Rate: Landing page 2-5%, e-commerce 1.5-3.5%, lead gen 5-15%
+
+RULE 6, ADAPTIVE FLIGHT PLAN WITH REAL PHASING:
+Don't use dots or symbols. Use real tactical descriptions per phase.
+The flight_plan JSON keys MUST match the campaign duration:
+${flightKeyInstruction}
+Fill ALL columns with specific tactical actions. Do NOT leave any column empty.
+
+RULE 7, CHANNEL TACTICS MUST BE SPECIFIC:
+Don't say "Primary campaign execution" or "Audience targeting". Instead say things like:
+- "Broad match + exact match keyword targeting for [specific terms], using responsive search ads with 4 headline variations"
+- "Lookalike audiences (1-3%) seeded from past purchasers, running carousel + video ads with UGC creative"
+- "Contextual targeting on premium publishers (Forbes, CNN) via DV360, 300x250 + 728x90 formats"
+Each channel should have 3-5 specific, actionable tactics.
+
+RULE 8, COMPETITIVE SOV WITH REAL NAMES:
+competitive_sov must include ${data.brandName} AND the same real competitors from the competitors section. Include realistic estimated monthly ad spend, SOV %, their primary advertising channels, and messaging themes.
+
+RULE 9, MINIMUM CONTENT REQUIREMENTS:
+- "risks" array: Provide AT LEAST 3-4 risks (e.g., CPC spikes, low conversion rate, ad fatigue/creative burnout, budget exhaustion, audience saturation, competitive bidding pressure, platform policy changes)
+- "attribution_models" array: Provide AT LEAST 3 models (e.g., Data-Driven Attribution, Last Click, First Touch, Linear, Time Decay, Position-Based, pick the most relevant 3-4 for the campaign type)
+- "monitoring_tools" array: Provide AT LEAST 3 monitoring tools (e.g., Google Ads Alerts, SEMrush/SpyFu for competitive monitoring, Google Analytics 4 real-time, HubSpot/CRM notifications, social listening tools, pick appropriate ones for the budget scale)
+- "budget_breakdown" cpm field: ALWAYS fill with the actual CPM or CPC rate used (e.g., "$3.00 CPC" or "$7.50 CPM"). NEVER leave as "$0.00" or empty.
+
+RULE 10, CRO AUDIT (WEBSITE CONVERSION ANALYSIS):
+If website content was provided, analyze it for conversion rate optimization (CRO) elements.
+Score the landing page out of 10 based on: clear value proposition, social proof (testimonials, logos, reviews), urgency/scarcity elements, trust signals (certifications, guarantees, security badges), clear CTAs, mobile optimization indicators, page load signals, and form simplicity.
+Identify exactly 3 missing or weak persuasive elements.
+Provide exactly 3 specific, actionable CRO recommendations.
+If no website content was provided, give a general score of "5/10" and generic best-practice recommendations.
+
+RULE 11, HONESTY GUARDRAILS (ANTI-HALLUCINATION):
+For competitive analysis: clearly label ALL spend estimates and market share figures as approximations. Use language like "estimated at" or "approximately", NEVER present competitor spend or market share as verified data.
+If you are not confident a specific competitor exists in the client's niche, use hedging: "Competitors may include [X]" rather than stating definitively.
+For market statistics in situation_analysis, use "industry reports suggest" or "estimates indicate", NEVER cite a specific percentage without attributing it to a general source.
+For competitive_sov spend estimates: ALWAYS append "est." to spend figures. These are directional, not audited.
+IMPORTANT: The "ai_data_confidence" field must honestly rate how confident you are in the competitive data: "high" (client provided competitors + well-known brands), "medium" (AI-identified competitors in a well-known industry), "low" (niche industry, competitors may not be accurate).
+
+RULE 12, CREATIVE BRIEF PER CHANNEL:
+For each channel in the media mix, generate a mini creative brief with:
+- "format": The recommended primary ad format (e.g., "Responsive Search Ads", "Single Image + Carousel", "15s Pre-Roll + 6s Bumper")
+- "headline_direction": 2-3 suggested headline approaches (not full headlines, just the direction/angle)
+- "cta": The recommended call-to-action text
+- "creative_notes": 1-2 sentences on visual/copy guidance specific to this channel
+${data.creativeAssets ? 'The client has these creative assets available: ' + data.creativeAssets + '. Tailor format recommendations to what they actually have, do NOT recommend video-heavy campaigns if they have no video assets.' : 'The client has not specified available creative assets. Recommend achievable formats and flag where they may need to produce new assets.'}
+
+RULE 13, INDUSTRY BENCHMARK COMPARISON:
+Provide a benchmarks array comparing the plan's projected metrics against industry averages for ${data.industry}. Include 4-6 key metrics (CPC, CPM, CTR, CPA, conversion rate, ROAS as relevant). For each, show: the plan's target, the industry average, and whether the plan is above/below/at benchmark. ${data.pastPerformance ? 'The client reports past performance of: ' + data.pastPerformance + '. Use this to calibrate targets, if their historical CPA is higher than industry average, set realistic goals that improve on their past but do not assume best-in-class performance overnight.' : 'No past performance data provided, use industry midpoints as targets.'}
+
+RULE 14, GOAL-SPECIFIC KPI ALIGNMENT:
+The client's campaign goal is "${data.goal}" with primary KPI "${data.kpi}". Your entire plan must align to this goal:
+${goalKpiBlock}
+The benchmarks and KPI sections must ONLY include metrics relevant to "${data.goal}". Do NOT include ROAS for non-revenue goals.
+
+RULE 19, INDUSTRY CROSS-VALIDATION:
+The user selected "${data.industry}" as their industry. However, you MUST cross-check this against the brand name ("${data.brandName}"), the website content (if provided), and your own knowledge of the brand.
+If the brand clearly belongs to a DIFFERENT industry than what the user selected:
+1. Use the CORRECT industry for all benchmarks, channel weights, CPM/CPC rates, competitor selection, and strategic recommendations. Do NOT blindly follow the user's dropdown selection if it contradicts reality.
+2. Set "detected_industry" in your JSON response to the ACTUAL industry you believe the brand belongs to (e.g., "Retail", "Automotive", "Technology").
+3. Set "industry_mismatch" to true in your JSON response.
+4. In the "situation_analysis.brand_position" text, note: "Note: While the input categorized this brand under ${data.industry}, our analysis indicates ${data.brandName} operates in the [correct industry] sector. All benchmarks and recommendations in this plan reflect [correct industry] standards."
+If the brand DOES match the selected industry, set "detected_industry" to "${data.industry}" and "industry_mismatch" to false.
+This rule takes priority over RULE 3, RULE 5, RULE 8, and RULE 13 when an industry mismatch is detected, because all of those rules reference industry-specific benchmarks.
+${keywordData ? `
+RULE 15, REAL KEYWORD DATA (from Google Keyword Planner):
+The following keyword data is REAL, sourced from Google Keyword Planner API. Use these EXACT figures when generating search keyword recommendations. Do NOT estimate or hallucinate keyword metrics when real data is provided.
+${JSON.stringify(keywordData.slice(0, 20), null, 2)}
+Use the avg_monthly_searches, competition, low_cpc, and high_cpc values from above to:
+- Set realistic CPC targets in the budget breakdown for search channels
+- Recommend specific keywords with their actual search volumes
+- Validate that the search budget can deliver the projected clicks at these CPC rates
+- Flag high-competition keywords that may require higher budgets
+` : ''}
+${competitorIntelBlock || ''}
+Return ONLY valid JSON (no markdown, no code fences, no explanation text before or after):
+{"executive_summary":"3-5 sentences summarizing strategy, budget, channels, and expected outcomes with specific numbers","total_investment":"$XXX,XXX","projected_impressions":"XX.XM","target_roas":"X.X:1","target_reach_pct":"XX%","situation_analysis":{"market_overview":"2-3 paragraph analysis of ${data.industry} market trends, digital ad spend trends, and consumer behavior shifts","brand_position":"1-2 paragraph analysis of ${data.brandName}'s current market position and opportunities"},"competitors":[{"name":"REAL BRAND NAME","market_share":"XX%","strengths":"specific strengths","strategy":"their actual media/advertising strategy"}],"target_audience":{"demographics":"detailed","psychographics":"detailed lifestyle and values","geographic":"${data.location} with specifics","behavioral":"online behavior, purchase patterns, media consumption","secondary_audience":"defined segment"},"marketing_objectives":["specific, measurable objectives with numbers"],"media_objectives":["specific media metrics with targets"],"media_strategy":"2-3 paragraph strategy connecting channels to funnel stages and campaign goal","channels":[{"name":"channel name","budget_pct":"XX%","rationale":"why this channel for this goal and audience","tactics":["specific tactic 1","specific tactic 2","specific tactic 3"]}],"flight_plan":[{"channel":"name",${flightPlanKeysTemplate}}],"budget_breakdown":[{"item":"Channel Name","pct":"XX%","impressions":"X.XM (at $X.XX CPM)","cpm":"$X.XX CPM"}],"kpis":[{"kpi":"metric name","target":"specific number based on benchmarks","tool":"measurement tool","frequency":"Weekly/Bi-weekly/Monthly"}],"reporting_plan":["specific reporting actions"],"risks":[{"risk":"specific risk","impact":"High/Medium/Low","probability":"High/Medium/Low","mitigation":"specific mitigation steps"}],"attribution_models":[{"model":"model name","use_case":"when to use","credit_logic":"how credit is assigned","tool":"specific tool"}],"analytics_stack":["specific tool and its purpose"],"customer_journey":[{"stage":"Awareness/Consideration/Conversion","touchpoints":"specific channels and formats","tracking":"specific tracking method","metrics":"specific metrics"}],"competitive_sov":[{"brand":"REAL BRAND NAME","spend":"$XXK/mo est.","sov_pct":"XX%","channels":"their ad channels","messaging":"their messaging themes"}],"market_opportunities":["specific, actionable opportunities"],"monitoring_tools":[{"tool":"specific tool name","frequency":"how often","metrics":"what to track","trigger":"when to act"}],"recommendations":["specific, prioritized next steps"],"cro_audit":{"landing_page_score":"X/10","missing_elements":["missing element 1","missing element 2","missing element 3"],"recommendations":["actionable CRO tip 1","actionable CRO tip 2","actionable CRO tip 3"]},"creative_briefs":[{"channel":"channel name matching channels array","format":"recommended ad format","headline_direction":["angle 1","angle 2"],"cta":"Call-to-action text","creative_notes":"visual/copy guidance"}],"benchmarks":[{"metric":"CPC or CPM or CTR etc","plan_target":"$X.XX or X%","industry_avg":"$X.XX or X%","vs_benchmark":"Below avg or Above avg or At benchmark"}],"ai_data_confidence":"high/medium/low","detected_industry":"the ACTUAL industry this brand belongs to based on your analysis","industry_mismatch":false}`;
+
+  return prompt;
+}
+
+
 // ── Health Check ──
 app.get('/', (req, res) => {
   res.json({
     status: 'ok',
-    service: 'RespondIQ™ Backend v12.5 (Gemini 3.1 Pro + Keyword Planner + Competitive Intel + Benchmark Anchors + Industry Detection)',
+    service: 'RespondIQ™ Backend v12.6 (Gemini 3.1 Pro + Server-Side Prompts + SSRF Protection + Keyword Planner + Competitive Intel + Benchmark Anchors)',
     model: 'gemini-3.1-pro-preview',
     thinking: 'MEDIUM',
     hosting: 'Render.com'
   });
 });
 
-// ── Diagnostic: Check env vars are loaded (no values exposed, just presence) ──
-app.get('/api/debug', (req, res) => {
-  res.json({
-    env_check: {
-      GEMINI_API_KEY: !!process.env.GEMINI_API_KEY,
-      EMAILJS_SERVICE_ID: !!process.env.EMAILJS_SERVICE_ID,
-      EMAILJS_TEMPLATE_ID: !!process.env.EMAILJS_TEMPLATE_ID,
-      EMAILJS_PLAN_TEMPLATE_ID: !!process.env.EMAILJS_PLAN_TEMPLATE_ID,
-      EMAILJS_PUBLIC_KEY: !!process.env.EMAILJS_PUBLIC_KEY,
-      EMAILJS_PRIVATE_KEY: !!process.env.EMAILJS_PRIVATE_KEY,
-      FRONTEND_URL: process.env.FRONTEND_URL || '(not set)',
-      GOOGLE_SHEETS_WEBHOOK: !!process.env.GOOGLE_SHEETS_WEBHOOK,
-      GOOGLE_ADS_DEVELOPER_TOKEN: !!process.env.GOOGLE_ADS_DEVELOPER_TOKEN,
-      GOOGLE_ADS_CLIENT_ID: !!process.env.GOOGLE_ADS_CLIENT_ID,
-      GOOGLE_ADS_CLIENT_SECRET: !!process.env.GOOGLE_ADS_CLIENT_SECRET,
-      GOOGLE_ADS_REFRESH_TOKEN: !!process.env.GOOGLE_ADS_REFRESH_TOKEN,
-      GOOGLE_ADS_CUSTOMER_ID: !!process.env.GOOGLE_ADS_CUSTOMER_ID,
-      GOOGLE_ADS_LOGIN_CUSTOMER_ID: !!process.env.GOOGLE_ADS_LOGIN_CUSTOMER_ID,
-      KEYWORD_SERVICE_READY: isKeywordServiceConfigured(),
-      BENCHMARK_DATA: getBenchmarkMeta(),
-    },
-    cors_origins: ALLOWED_ORIGINS
-  });
-});
 
-// ── Diagnostic: Fire a test email (plan delivery only - OTP flow removed) ──
-app.get('/api/test-email', async (req, res) => {
-  try {
-    const payload = {
-      service_id: process.env.EMAILJS_SERVICE_ID,
-      template_id: process.env.EMAILJS_PLAN_TEMPLATE_ID || process.env.EMAILJS_TEMPLATE_ID,
-      user_id: process.env.EMAILJS_PUBLIC_KEY,
-      accessToken: process.env.EMAILJS_PRIVATE_KEY,
-      template_params: {
-        to_email: 'test@test.com',
-        to_name: 'Debug Test',
-        brand_name: 'RespondIQ Debug',
-        plan_summary: 'This is a test email from the RespondIQ backend.'
-      }
-    };
-    const response = await fetch('https://api.emailjs.com/api/v1.0/email/send', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload)
-    });
-    const text = await response.text();
-    res.json({
-      emailjs_status: response.status,
-      emailjs_response: text,
-      diagnosis: response.ok ? 'EmailJS is working!' :
-        response.status === 401 ? 'PRIVATE_KEY is wrong.' :
-        response.status === 403 ? 'SERVICE_ID or PUBLIC_KEY mismatch.' :
-        response.status === 422 ? 'TEMPLATE_ID is wrong or template variables mismatch.' :
-        'Unknown error - check emailjs_response for details.'
-    });
-  } catch (err) {
-    res.json({ error: err.message, diagnosis: 'Network error calling EmailJS API from Render server.' });
-  }
-});
+
+
 
 
 // ══════════════════════════════════════════════════════════════
@@ -287,10 +578,6 @@ app.post('/generate-plan', async (req, res) => {
 
     const requestBody = req.body;
 
-    if (!requestBody.messages || !Array.isArray(requestBody.messages)) {
-      return res.status(400).json({ error: 'Invalid request: messages array required' });
-    }
-
     // ── REFINE PLAN: User has an existing plan and wants changes ──
     if (requestBody.refine_instruction && requestBody.current_plan) {
       console.log('[RespondIQ] Refine request:', requestBody.refine_instruction.substring(0, 80));
@@ -298,7 +585,7 @@ app.post('/generate-plan', async (req, res) => {
       const refineSystem = `You are a senior media strategist. The user has an existing media plan (JSON) and wants changes.
 Return the FULL updated JSON plan (not a partial diff).
 Maintain valid math: all budget_pct must sum to 100%, impressions must recalculate from budget changes, and all fields must remain populated.
-Return ONLY valid JSON — no markdown, no code fences, no explanation text.`;
+Return ONLY valid JSON, no markdown, no code fences, no explanation text.`;
 
       const refineUser = `Here is the current media plan JSON:\n\n${JSON.stringify(requestBody.current_plan)}\n\nThe user wants the following change:\n"${requestBody.refine_instruction}"\n\nReturn the FULL updated JSON plan with this change applied. Recalculate all affected numbers (budget splits, impressions, KPIs) to maintain mathematical consistency. Return ONLY the JSON object.`;
 
@@ -306,7 +593,6 @@ Return ONLY valid JSON — no markdown, no code fences, no explanation text.`;
         const refineText = await callGemini(refineSystem, [], refineUser, { maxOutputTokens: 8192 });
         console.log('[RespondIQ] Refine complete, chars:', refineText.length);
 
-        // Wrap in OpenAI-compatible shape so frontend JSON parsing is unchanged
         return res.json({
           choices: [{ message: { content: refineText } }]
         });
@@ -316,9 +602,26 @@ Return ONLY valid JSON — no markdown, no code fences, no explanation text.`;
       }
     }
 
+    // ── PRIORITY 2: Accept clean form_data from frontend (prompt built server-side) ──
+    const data = requestBody.form_data;
+    if (!data || !data.brandName) {
+      return res.status(400).json({ error: 'Invalid request: form_data with brandName required' });
+    }
+
+    // Parse budget and duration
+    const bInfo = BUDGET_MAP[data.budget] || BUDGET_MAP['$10,000 - $25,000'];
+    const months = DURATION_MONTHS[data.campaignDuration] || 3;
+    const totalBudgetLow = bInfo.low * months;
+    const totalBudgetHigh = bInfo.high * months;
+    const totalBudgetMid = bInfo.mid * months;
+
+    // Accept keyword data and competitor intel passed from frontend data-fetch calls
+    const keywordData = requestBody.keyword_data || null;
+    let frontendCompetitorIntelBlock = requestBody.competitor_intel_block || '';
+
     // ── WEBSITE INTELLIGENCE: Scrape client site for real business context ──
     let websiteIntel = { text: '', techStack: [], socialLinks: [] };
-    const siteUrl = requestBody.website_url || '';
+    const siteUrl = data.website || '';
     if (siteUrl && siteUrl !== 'N/A' && siteUrl.length > 3) {
       try {
         websiteIntel = await scrapeWebsite(siteUrl);
@@ -331,78 +634,40 @@ Return ONLY valid JSON — no markdown, no code fences, no explanation text.`;
       }
     }
 
-    // ── Inject Website Intelligence into user message ──
-    let messages = requestBody.messages.map(msg => {
-      if (msg.role === 'user' && (websiteIntel.text || websiteIntel.techStack.length || websiteIntel.socialLinks.length)) {
-        let intel = '\n\n=== WEBSITE INTELLIGENCE (scraped from ' + siteUrl + ') ===\n';
-        intel += 'Below is ACTUAL content from the client website. Use this to:\n';
-        intel += '1. Understand what the brand ACTUALLY does\n';
-        intel += '2. Identify REAL competitive peers matched by service type AND company scale\n';
-        intel += '3. Do NOT pick Fortune 500 companies unless the client is Fortune 500\n\n';
-
-        // Social Presence (informs channel selection)
-        if (websiteIntel.socialLinks.length) {
-          intel += 'SOCIAL PRESENCE DETECTED: ' + websiteIntel.socialLinks.join(', ') + '\n';
-          intel += 'Use this to inform channel selection — prioritize platforms where the brand already has a presence.\n';
-        } else {
-          intel += 'SOCIAL PRESENCE: No social media links found on the website.\n';
-        }
-
-        intel += '\n' + websiteIntel.text;
-        return { role: msg.role, content: msg.content + intel };
-      }
-      return msg;
-    });
-
     // ── INDUSTRY VERIFICATION: Detect actual industry BEFORE pipeline steps ──
-    // If the user selected the wrong industry in the form, this corrects it so
-    // competitor identification, benchmark injection, and the main Gemini call
-    // all operate on the REAL industry from the start.
     let industryOverride = null;
-    const formIndustry = requestBody.industry || '';
-    // Extract brand name from either the explicit field or the user prompt
-    const brandNameForDetection = requestBody.brand_name
-      || (requestBody.messages?.find(m => m.role === 'user')?.content?.match(/Brand:\s*(.+?)(?:\n|$)/)?.[1] || '').trim();
+    const formIndustry = data.industry || '';
 
-    if (brandNameForDetection && formIndustry) {
-      industryOverride = await detectActualIndustry(brandNameForDetection, formIndustry, websiteIntel.text);
+    if (data.brandName && formIndustry) {
+      industryOverride = await detectActualIndustry(data.brandName, formIndustry, websiteIntel.text);
     }
 
-    // Resolve the effective industry: use override if corrected, else form value
     const effectiveIndustry = (industryOverride && industryOverride.corrected)
       ? industryOverride.label
       : formIndustry;
     const effectiveIndustryKey = (industryOverride && industryOverride.corrected)
       ? industryOverride.key
-      : null; // null = resolveIndustryKey will resolve from the string as before
+      : null;
 
     if (industryOverride && industryOverride.corrected) {
       console.log('[RespondIQ] Industry CORRECTED:', formIndustry, '->', effectiveIndustry, '(key:', industryOverride.key + ')');
     }
 
     // ── AUTO-TRIGGER: Competitive Intelligence via Google Ads Transparency ──
-    // When frontend sends auto_competitive_intel: true (competitors field was blank),
-    // we identify competitors via a lightweight Gemini call, then query Transparency Center.
-    // Uses effectiveIndustry (corrected if needed) so competitors match the real vertical.
     let competitiveIntelResults = [];
-    let competitiveIntelBlock = '';
+    let competitiveIntelBlock = frontendCompetitorIntelBlock;
 
-    if (requestBody.auto_competitive_intel) {
+    if (!data.competitors) {
       try {
-        const brandName = requestBody.brand_name || '';
-        const industry = effectiveIndustry; // FIXED: was requestBody.industry
-        const companySize = requestBody.company_size || '';
+        const industry = effectiveIndustry;
+        const companySize = data.companySize || '';
 
-        console.log('[RespondIQ] Auto-trigger competitive intel for:', brandName, '|', industry, '|', companySize);
+        console.log('[RespondIQ] Auto-trigger competitive intel for:', data.brandName, '|', industry, '|', companySize);
 
-        // Step 1: Lightweight Gemini call to identify real competitors
-        const identifiedNames = await identifyCompetitors(brandName, industry, companySize, websiteIntel.text);
+        const identifiedNames = await identifyCompetitors(data.brandName, industry, companySize, websiteIntel.text);
 
         if (identifiedNames.length > 0) {
-          // Step 2: Query Google Ads Transparency Center for each competitor
           competitiveIntelResults = await getCompetitiveIntelligence(identifiedNames);
-
-          // Step 3: Build RULE 16 prompt block to inject into the main call
           competitiveIntelBlock = buildCompetitorPromptBlock(competitiveIntelResults);
 
           const foundCount = competitiveIntelResults.filter(r => r.found).length;
@@ -411,77 +676,62 @@ Return ONLY valid JSON — no markdown, no code fences, no explanation text.`;
           console.log('[RespondIQ] Auto-trigger: no competitors identified, skipping Transparency lookup');
         }
       } catch (err) {
-        // Entirely graceful: never break plan generation if competitive intel fails
         console.warn('[RespondIQ] Auto-trigger competitive intel failed (graceful):', err.message);
       }
     }
 
-    // ── Inject competitive intel block into the user message (if available) ──
-    if (competitiveIntelBlock) {
-      messages = messages.map(msg => {
-        if (msg.role === 'user') {
-          return { role: msg.role, content: msg.content + '\n\n' + competitiveIntelBlock };
-        }
-        return msg;
-      });
+    // ── BUILD PROMPTS SERVER-SIDE (Priority 2) ──
+    const systemInstruction = buildSystemPrompt(data);
+    let userPrompt = buildUserPrompt(data, bInfo, months, totalBudgetLow, totalBudgetHigh, totalBudgetMid, keywordData, competitiveIntelBlock);
+
+    // ── Inject Website Intelligence into user prompt ──
+    if (websiteIntel.text || websiteIntel.techStack.length || websiteIntel.socialLinks.length) {
+      let intel = '\n\n=== WEBSITE INTELLIGENCE (scraped from ' + siteUrl + ') ===\n';
+      intel += 'Below is ACTUAL content from the client website. Use this to:\n';
+      intel += '1. Understand what the brand ACTUALLY does\n';
+      intel += '2. Identify REAL competitive peers matched by service type AND company scale\n';
+      intel += '3. Do NOT pick Fortune 500 companies unless the client is Fortune 500\n\n';
+
+      if (websiteIntel.socialLinks.length) {
+        intel += 'SOCIAL PRESENCE DETECTED: ' + websiteIntel.socialLinks.join(', ') + '\n';
+        intel += 'Use this to inform channel selection, prioritize platforms where the brand already has a presence.\n';
+      } else {
+        intel += 'SOCIAL PRESENCE: No social media links found on the website.\n';
+      }
+
+      intel += '\n' + websiteIntel.text;
+      userPrompt += intel;
     }
 
-    // ── LAYER 1: Inject benchmark anchors as RULE 17 ──
-    // Uses effectiveIndustry (corrected if needed) so benchmarks match the real vertical.
-    // Benchmarks are starting anchors, not a ceiling. Gemini adjusts them based on user
-    // inputs (geography, competition level, audience specificity, campaign type, etc.)
+    // ── LAYER 1: Inject benchmark anchors ──
     const industryForBenchmark = effectiveIndustryKey
-      ? BENCHMARKS[effectiveIndustryKey].label  // Pre-verified key from detection
-      : (requestBody.industry || '');            // Fallback: original form value
+      ? BENCHMARKS[effectiveIndustryKey].label
+      : (data.industry || '');
     const benchmarkBlock = buildBenchmarkPromptBlock(industryForBenchmark);
-    messages = messages.map(msg => {
-      if (msg.role === 'user') {
-        return { role: msg.role, content: msg.content + '\n\n' + benchmarkBlock };
-      }
-      return msg;
-    });
+    userPrompt += '\n\n' + benchmarkBlock;
     console.log('[RespondIQ] Benchmark anchors injected | industry:', industryForBenchmark || '(default fallback)',
       industryOverride && industryOverride.corrected ? '(CORRECTED from ' + formIndustry + ')' : '');
 
     // ── Inject industry correction notice into prompt (if corrected) ──
-    // Tells Gemini explicitly that the pipeline already uses corrected data,
-    // so it sets industry_mismatch/detected_industry in its JSON output.
     if (industryOverride && industryOverride.corrected) {
-      messages = messages.map(msg => {
-        if (msg.role === 'user') {
-          return { role: msg.role, content: msg.content +
-            '\n\nINDUSTRY CORRECTION APPLIED: The user selected "' + formIndustry +
-            '" but pre-analysis detected this brand operates in "' + effectiveIndustry + '". ' +
-            'The benchmark anchors and competitor identification in this prompt ALREADY use ' + effectiveIndustry + ' data. ' +
-            'Set industry_mismatch to true and detected_industry to "' + effectiveIndustry + '" in your JSON output.' };
-        }
-        return msg;
-      });
+      userPrompt += '\n\nINDUSTRY CORRECTION APPLIED: The user selected "' + formIndustry +
+        '" but pre-analysis detected this brand operates in "' + effectiveIndustry + '". ' +
+        'The benchmark anchors and competitor identification in this prompt ALREADY use ' + effectiveIndustry + ' data. ' +
+        'Set industry_mismatch to true and detected_industry to "' + effectiveIndustry + '" in your JSON output.';
     }
 
-    // ── Extract system instruction and build history for callGemini ──
-    const systemMsg = messages.find(m => m.role === 'developer' || m.role === 'system');
-    const systemInstruction = systemMsg ? systemMsg.content : '';
-    const conversationMsgs = messages.filter(m => m.role !== 'developer' && m.role !== 'system');
-    const history = conversationMsgs.slice(0, -1).map(m => ({
-      role: m.role === 'assistant' ? 'model' : 'user',
-      parts: [{ text: m.content }]
-    }));
-    const lastMessage = conversationMsgs[conversationMsgs.length - 1]?.content || '';
-
-    const responseText = await callGemini(systemInstruction, history, lastMessage, {
+    // ── Call Gemini ──
+    const responseText = await callGemini(systemInstruction, [], userPrompt, {
       maxOutputTokens: 8192
     });
 
     console.log('[RespondIQ] Gemini response received, chars:', responseText.length);
 
     // ── Wrap response in OpenAI-compatible shape ──
-    // Frontend reads: result.choices[0].message.content — this keeps it unchanged
     const result = {
       choices: [{ message: { content: responseText } }]
     };
 
-    // Attach tech stack + social data so frontend can display it (unchanged from v11)
     if (websiteIntel.techStack.length || websiteIntel.socialLinks.length) {
       result._website_intel = {
         tech_stack: websiteIntel.techStack,
@@ -489,12 +739,10 @@ Return ONLY valid JSON — no markdown, no code fences, no explanation text.`;
       };
     }
 
-    // Attach competitive intel metadata so frontend can render verified badges
     if (competitiveIntelResults.length > 0) {
       result._competitive_intel = competitiveIntelResults;
     }
 
-    // Attach industry override metadata so frontend knows the correction happened
     if (industryOverride && industryOverride.corrected) {
       result._industry_override = {
         form_industry: industryOverride.formIndustry,
@@ -556,10 +804,16 @@ async function scrapeWebsite(url) {
 }
 
 async function fetchPage(url) {
+  // SSRF validation: reject private IPs, metadata endpoints, non-standard ports
+  const validation = await validateUrl(url);
+  if (!validation.valid) {
+    console.warn('[RespondIQ] fetchPage blocked (SSRF):', url, '|', validation.reason);
+    return { text: '', techStack: [], socialLinks: [] };
+  }
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), 8000);
   try {
-    const r = await fetch(url, {
+    const r = await fetch(validation.url, {
       signal: ac.signal,
       headers: { 'User-Agent': 'Mozilla/5.0 (compatible; RespondIQ/2.0)', 'Accept': 'text/html' }
     });
@@ -717,60 +971,7 @@ app.post('/api/keyword-ideas', async (req, res) => {
 });
 
 
-// ══════════════════════════════════════════════════════════════
-// SECURE EMAIL PROXY: /api/send-email
-// All EmailJS secrets stay server-side
-// ══════════════════════════════════════════════════════════════
-app.post('/api/send-email', async (req, res) => {
-  const SERVICE_ID = process.env.EMAILJS_SERVICE_ID;
-  const PUBLIC_KEY = process.env.EMAILJS_PUBLIC_KEY;
-  const PRIVATE_KEY = process.env.EMAILJS_PRIVATE_KEY;
 
-  const requestedTemplate = req.body.template_id || '';
-  const TEMPLATE_ID = requestedTemplate === 'template_media_plan'
-    ? process.env.EMAILJS_PLAN_TEMPLATE_ID
-    : process.env.EMAILJS_TEMPLATE_ID;
-
-  if (!SERVICE_ID || !PUBLIC_KEY || !PRIVATE_KEY) {
-    return res.status(500).json({ error: 'Email service not configured. Set EMAILJS_* vars in Render > Environment.' });
-  }
-  if (!TEMPLATE_ID) {
-    return res.status(500).json({ error: 'Email template not configured. Set EMAILJS_PLAN_TEMPLATE_ID in Render > Environment.' });
-  }
-
-  const { template_params } = req.body;
-  if (!template_params || !template_params.to_email) {
-    return res.status(400).json({ error: 'Missing template_params or to_email' });
-  }
-
-  try {
-    console.log('[RespondIQ] Sending email to:', template_params.to_email,
-      '| Template:', requestedTemplate === 'template_media_plan' ? 'PLAN' : 'GENERAL');
-    const response = await fetch('https://api.emailjs.com/api/v1.0/email/send', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        service_id: SERVICE_ID,
-        template_id: TEMPLATE_ID,
-        user_id: PUBLIC_KEY,
-        accessToken: PRIVATE_KEY,
-        template_params: template_params
-      })
-    });
-
-    const text = await response.text();
-    console.log('[RespondIQ] EmailJS response:', response.status, text);
-
-    if (response.ok) {
-      res.json({ success: true, message: 'Email sent' });
-    } else {
-      res.status(response.status).json({ error: 'EmailJS error: ' + text });
-    }
-  } catch (err) {
-    console.error('[RespondIQ] Email send error:', err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
 
 
 // ══════════════════════════════════════════════════════════════
@@ -842,6 +1043,6 @@ app.post('/api/refresh-benchmarks', async (req, res) => {
 
 // ── Start Server ──
 app.listen(PORT, () => {
-  console.log(`[RespondIQ] Backend v12.5 (Gemini 3.1 Pro | MEDIUM thinking | Benchmark Anchors | Industry Detection) running on port ${PORT}`);
+  console.log(`[RespondIQ] Backend v12.6 (Gemini 3.1 Pro | MEDIUM thinking | Server-Side Prompts | SSRF Protection | Benchmark Anchors | Industry Detection) running on port ${PORT}`);
   console.log(`[RespondIQ] CORS origins: ${ALLOWED_ORIGINS.join(', ')}`);
 });
