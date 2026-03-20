@@ -1,5 +1,6 @@
 // ═══════════════════════════════════════════════════════════════
-// RespondIQ™ v12 — Gemini 3.1 Pro + Medium Thinking + Search Grounding
+// RespondIQ™ v12.6 — Gemini 3.1 Pro + Medium Thinking + Search Grounding
+// + Server-Side Prompts + SSRF Protection
 // AI Model: gemini-3.1-pro-preview (thinking_level: MEDIUM)
 // Hosted on: Render.com (Web Service)
 // ═══════════════════════════════════════════════════════════════
