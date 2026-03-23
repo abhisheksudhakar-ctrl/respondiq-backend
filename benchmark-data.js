@@ -359,7 +359,16 @@ function buildBenchmarkPromptBlock(industryString) {
   block += `\nCONSISTENCY REQUIREMENT: Whatever rates you choose for a channel, use the SAME rates `;
   block += `consistently across ALL sections of this plan (Section 05 budget, Section 09 channel detail, `;
   block += `Section 16 benchmarks). Do not use $${BENCHMARKS[key].channels.google_search?.cpc} CPC in `;
-  block += `one section and a different CPC for the same channel in another section.\n`;
+  block += `one section and a different CPC for the same channel in another section.\n\n`;
+
+  block += `SECTION 16 RULE: In Section 16 (Industry Benchmark Comparison), the "Industry Average" column `;
+  block += `MUST display the BASELINE RATES listed above, NOT the plan's own targets. The "Plan Target" `;
+  block += `column shows the rates you chose for THIS campaign (which may be adjusted up or down from the `;
+  block += `baseline). The "vs. Benchmark" column then compares them. If you adjusted a rate upward, mark `;
+  block += `it "Above avg" with a warning. If you adjusted downward, mark it "Below avg" with a checkmark. `;
+  block += `If you used the baseline rate exactly, mark it "At benchmark". The two columns MUST show `;
+  block += `DIFFERENT values when you have adjusted rates for the campaign context. Identical values in `;
+  block += `both columns defeat the purpose of the benchmark comparison.\n`;
 
   return block;
 }
