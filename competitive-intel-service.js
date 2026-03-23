@@ -61,34 +61,76 @@ def search_competitor(query):
         if not parsed:
             return result
 
-        # Pick best match: require name similarity, then prefer US > GB > highest ad count
-        with_ads = [p for p in parsed if p["ad_count"] > 0]
-        pool = with_ads if with_ads else parsed
+        # Pick best match: require name similarity AND minimum ad activity
+        # P0-2: Added minimum ad count guard to reject low-activity false positives
+        MIN_ADS_THRESHOLD = 5  # Reject entities with fewer than 5 ads
+        with_meaningful_ads = [p for p in parsed if p["ad_count"] >= MIN_ADS_THRESHOLD]
+        pool = with_meaningful_ads if with_meaningful_ads else []
+
+        # If no entities meet the ad threshold, check if ANY have ads
+        # Only fall back to low-ad entities if the name is an exact or near-exact match
+        if not pool:
+            exact_matches = [p for p in parsed if p["ad_count"] > 0 and
+                             (p["name"].lower().strip() == query_lower or
+                              query_lower.replace('.', '') == p["name"].lower().strip().replace('.', ''))]
+            pool = exact_matches if exact_matches else []
+
+        if not pool:
+            result["found"] = False
+            return result
 
         query_lower = query.lower().strip()
         query_words = set(query_lower.split())
 
         def name_similarity(candidate_name):
             """Score 0.0 to 1.0 based on how well the candidate name matches the query.
-            Uses bidirectional word overlap to reject false positives like
-            'That Company' matching 'That One Tech Company'."""
+            Uses bidirectional word overlap and strict guards to reject false positives."""
             cand_lower = candidate_name.lower().strip()
-            # Exact match (case-insensitive)
-            if cand_lower == query_lower:
+            # Exact match (case-insensitive), including with/without dots
+            if cand_lower == query_lower or cand_lower.replace('.','') == query_lower.replace('.',''):
                 return 1.0
-            # Check if query is contained in candidate or vice versa
-            # Guard: require length ratio >= 0.5 to prevent "Monday" matching "LOUIS MONDAY"
+
+            # Common business suffixes that don't change identity
+            biz_suffixes = {'llc', 'inc', 'inc.', 'ltd', 'ltd.', 'co', 'co.', 'corp', 'corp.',
+                           'corporation', 'group', 'the', 'company', 'limited', 'gmbh', 'sa',
+                           'americas', 'america', 'usa', 'us', 'uk', 'international', 'global'}
+
             shorter = min(len(query_lower), len(cand_lower))
             longer = max(len(query_lower), len(cand_lower))
             length_ratio = shorter / longer if longer > 0 else 0
-            if query_lower in cand_lower or cand_lower in query_lower:
+
+            # Check if query starts the candidate name (strongest positive signal)
+            if cand_lower.startswith(query_lower):
+                # Extra words after query are just business suffixes? High confidence match.
+                extra = cand_lower[len(query_lower):].strip().rstrip('.,')
+                extra_words = set(w.strip('.,') for w in extra.split() if w.strip('.,')) - {''}
+                # Reject if extra words contain long numeric codes (e.g., "5921" in "ORACLE 5921 LLC")
+                # but allow short version numbers like "365" in "Microsoft Dynamics 365"
+                has_random_id = any(w.isdigit() and len(w) >= 4 for w in extra_words)
+                if has_random_id:
+                    return 0.3  # Likely a different entity with same name prefix
+                if not extra_words or extra_words.issubset(biz_suffixes):
+                    return 0.9
+                # Extra words are not just suffixes, but query is still the leading term
+                if length_ratio >= 0.4:
+                    return 0.75
+                return 0.5
+
+            # Query appears inside candidate but NOT at start (e.g., "Padel Oracle")
+            if query_lower in cand_lower:
+                # Penalize heavily: query buried inside an unrelated name
+                if length_ratio >= 0.7:
+                    return 0.65
+                return 0.3
+
+            # Candidate is contained in query (query is longer)
+            if cand_lower in query_lower:
                 if length_ratio >= 0.5:
-                    return 0.85
-                # Low length ratio: substring match but too much extra text, penalize
-                return 0.4
+                    return 0.7
+                return 0.3
+
             # Bidirectional word overlap
             cand_words = set(cand_lower.replace(',', '').replace('.', '').split())
-            # Remove common suffixes that add noise
             noise = {'llc', 'inc', 'ltd', 'co', 'corp', 'corporation', 'group', 'the'}
             clean_query = query_words - noise
             clean_cand = cand_words - noise
@@ -215,23 +257,34 @@ async function getCompetitiveIntelligence(competitorNames) {
     const cleaned = name.trim();
     if (!cleaned) continue;
 
-    // Remove domain suffixes for cleaner search
-    const searchQuery = cleaned
-      .replace(/\.(com|co\.uk|io|net|org|ai)$/i, '')
+    // Remove protocol/www but KEEP domain suffix for first attempt
+    // "Monday.com" should search as "Monday.com" first, not just "Monday"
+    const cleanedFull = cleaned
       .replace(/^https?:\/\//, '')
       .replace(/^www\./, '');
 
+    // Fallback query strips domain suffix for broader search
+    const cleanedShort = cleanedFull
+      .replace(/\.(com|co\.uk|io|net|org|ai)$/i, '');
+
     // Check cache
-    const cacheKey = 'ci:' + searchQuery.toLowerCase();
+    const cacheKey = 'ci:' + cleanedFull.toLowerCase();
     const cached = cache.get(cacheKey);
     if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
       results.push(cached.data);
       continue;
     }
 
-    // Call Python scraper
+    // Try full name first (e.g., "Monday.com"), then short name (e.g., "Monday") if no good match
+    let searchQuery = cleanedFull;
     console.log('[RespondIQ] Querying Google Ads Transparency for:', searchQuery);
-    const raw = scrapeOneCompetitor(searchQuery);
+    let raw = scrapeOneCompetitor(searchQuery);
+
+    // If full name didn't find a good match and short name is different, try short
+    if ((!raw.found || !raw.best_match) && cleanedShort !== cleanedFull) {
+      console.log('[RespondIQ] Retrying Transparency with shorter query:', cleanedShort);
+      raw = scrapeOneCompetitor(cleanedShort);
+    }
 
     let structured;
     if (raw.found && raw.best_match) {
