@@ -77,8 +77,15 @@ def search_competitor(query):
             if cand_lower == query_lower:
                 return 1.0
             # Check if query is contained in candidate or vice versa
+            # Guard: require length ratio >= 0.5 to prevent "Monday" matching "LOUIS MONDAY"
+            shorter = min(len(query_lower), len(cand_lower))
+            longer = max(len(query_lower), len(cand_lower))
+            length_ratio = shorter / longer if longer > 0 else 0
             if query_lower in cand_lower or cand_lower in query_lower:
-                return 0.85
+                if length_ratio >= 0.5:
+                    return 0.85
+                # Low length ratio: substring match but too much extra text, penalize
+                return 0.4
             # Bidirectional word overlap
             cand_words = set(cand_lower.replace(',', '').replace('.', '').split())
             # Remove common suffixes that add noise
