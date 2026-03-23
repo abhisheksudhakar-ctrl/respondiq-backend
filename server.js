@@ -45,6 +45,48 @@ function getGeminiClient() {
 }
 
 // ══════════════════════════════════════════════════════════════
+// LLM RESPONSE PARSER: Extracts JSON from Gemini responses
+// Handles markdown fences, preamble text, and partial responses
+// ══════════════════════════════════════════════════════════════
+function extractJSONFromLLM(raw, expectedType) {
+  if (!raw || typeof raw !== 'string') return null;
+  // Step 1: Strip markdown code fences (```json ... ``` or ``` ... ```)
+  let text = raw.replace(/^```(?:json)?\s*\n?/gm, '').replace(/\n?```\s*$/gm, '').trim();
+  // Step 2: Try direct parse first (cleanest path)
+  try {
+    const parsed = JSON.parse(text);
+    if (expectedType === 'array' && Array.isArray(parsed)) return parsed;
+    if (expectedType === 'object' && parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
+    if (!expectedType) return parsed;
+  } catch (e) { /* direct parse failed, try extraction */ }
+  // Step 3: Brace/bracket-counting extraction for the outermost structure
+  const opener = expectedType === 'array' ? '[' : '{';
+  const closer = expectedType === 'array' ? ']' : '}';
+  const startIdx = text.indexOf(opener);
+  if (startIdx === -1) return null;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = startIdx; i < text.length; i++) {
+    const ch = text[i];
+    if (escaped) { escaped = false; continue; }
+    if (ch === '\\') { escaped = true; continue; }
+    if (ch === '"') { inString = !inString; continue; }
+    if (inString) continue;
+    if (ch === opener) depth++;
+    else if (ch === closer) {
+      depth--;
+      if (depth === 0) {
+        try {
+          return JSON.parse(text.substring(startIdx, i + 1));
+        } catch (e) { return null; }
+      }
+    }
+  }
+  return null;
+}
+
+// ══════════════════════════════════════════════════════════════
 // PRIORITY 1: SSRF VALIDATION
 // Rejects private IPs, metadata endpoints, non-standard ports
 // ══════════════════════════════════════════════════════════════
@@ -157,6 +199,20 @@ ABSOLUTE RULES YOU CANNOT BREAK:
 function buildUserPrompt(data, bInfo, months, totalBudgetLow, totalBudgetHigh, totalBudgetMid, keywordData, competitorIntelBlock) {
   const funnelAdvice = FUNNEL_GUIDE[data.goal] || FUNNEL_GUIDE['Sales & Conversions'];
 
+  // ── Channel count cap: if >12 channels selected, instruct AI to consolidate ──
+  const MAX_PRIMARY_CHANNELS = 12;
+  const channelList = (data.platform || '').split(',').map(c => c.trim()).filter(Boolean);
+  const channelCount = channelList.length;
+  let channelCapInstruction = '';
+  if (channelCount > MAX_PRIMARY_CHANNELS) {
+    channelCapInstruction = `\nCHANNEL CONSOLIDATION REQUIRED: The user selected ${channelCount} channels, which is too many to allocate meaningful budget to. You MUST:
+1. Select the TOP ${MAX_PRIMARY_CHANNELS} most impactful channels for the "${data.goal}" goal in the ${data.industry} industry.
+2. Allocate budget ONLY to those ${MAX_PRIMARY_CHANNELS} channels (plus a Contingency line).
+3. In the media_strategy section, briefly note which channels were deprioritized and why.
+4. Do NOT spread budget equally across all ${channelCount} channels at 1% each, that creates zero impact. Concentrate spend where it drives results.
+5. Weight the top channels using goal-appropriate allocation (e.g., for Sales & Conversions: 25-30% search, 20% social, 15% retargeting, etc.).`;
+  }
+
   const competitorInstruction = data.competitors
     ? `The client has identified these key competitors: ${data.competitors}. Use these EXACT competitor names in your analysis. For each competitor, describe their actual known advertising approach, what platforms they advertise on, their messaging themes, their estimated market share, and their competitive strengths. Research what their ads look like on Google Ads Transparency Center, Meta Ad Library, and LinkedIn Ads.`
     : `You MUST identify 3-5 REAL competitor brands that are ACTUAL competitive peers of ${data.brandName}. This is critical, follow these rules:
@@ -243,7 +299,7 @@ Target Location: ${data.location}${data.locationList && data.locationList.length
 Target Age: ${data.ageRange}
 Target Gender: ${data.gender}
 Household Income: ${data.income}
-Selected Channels: ${data.platform}
+Selected Channels: ${data.platform}${channelCapInstruction}
 Creative Formats: ${data.creativeFormat}
 Known Competitors: ${data.competitors || 'Not specified, you must identify them based on the brand, website, industry, and company size'}
 ${data.pastPerformance ? 'Past Campaign Performance: ' + data.pastPerformance : ''}
@@ -502,41 +558,20 @@ Respond with ONLY the JSON object. No explanation, no markdown.`;
     });
 
     const text = response.text || '';
-    // With responseMimeType: 'application/json', the response should be clean JSON.
-    // But we still attempt regex extraction as a safety net.
-    const match = text.match(/\{[\s\S]*?\}/);
-    if (match) {
-      const result = JSON.parse(match[0]);
-      // Validate the returned key exists in our benchmark database
-      if (result.industry_key && BENCHMARKS[result.industry_key]) {
-        console.log('[RespondIQ] Industry detection result:',
-          result.corrected ? `CORRECTED "${formIndustry}" -> "${result.industry_label}"` : `CONFIRMED "${formIndustry}"`,
-          '| reason:', result.reason || 'n/a');
-        return {
-          key: result.industry_key,
-          label: result.industry_label || BENCHMARKS[result.industry_key].label,
-          corrected: !!result.corrected,
-          reason: result.reason || '',
-          formIndustry: formIndustry,
-        };
-      }
+    // Robust JSON extraction: handles markdown fences, preamble text, partial responses
+    const result = extractJSONFromLLM(text, 'object');
+    if (result && result.industry_key && BENCHMARKS[result.industry_key]) {
+      console.log('[RespondIQ] Industry detection result:',
+        result.corrected ? `CORRECTED "${formIndustry}" -> "${result.industry_label}"` : `CONFIRMED "${formIndustry}"`,
+        '| reason:', result.reason || 'n/a');
+      return {
+        key: result.industry_key,
+        label: result.industry_label || BENCHMARKS[result.industry_key].label,
+        corrected: !!result.corrected,
+        reason: result.reason || '',
+        formIndustry: formIndustry,
+      };
     }
-
-    // Fallback: try to parse the entire response as JSON directly
-    try {
-      const directParse = JSON.parse(text.trim());
-      if (directParse.industry_key && BENCHMARKS[directParse.industry_key]) {
-        console.log('[RespondIQ] Industry detection (direct parse):',
-          directParse.corrected ? `CORRECTED "${formIndustry}" -> "${directParse.industry_label}"` : `CONFIRMED "${formIndustry}"`);
-        return {
-          key: directParse.industry_key,
-          label: directParse.industry_label || BENCHMARKS[directParse.industry_key].label,
-          corrected: !!directParse.corrected,
-          reason: directParse.reason || '',
-          formIndustry: formIndustry,
-        };
-      }
-    } catch (e) { /* direct parse failed, fall through */ }
 
     console.warn('[RespondIQ] Industry detection: could not parse response, using form value. Raw:', text.substring(0, 300));
     return null;
@@ -582,37 +617,17 @@ Respond with ONLY a JSON array of company name strings. No explanation, no markd
 
     const text = response.text || '';
 
-    // Attempt 1: Parse as clean JSON array (expected path with responseMimeType)
-    try {
-      const directParse = JSON.parse(text.trim());
-      if (Array.isArray(directParse) && directParse.length > 0) {
-        const names = directParse.filter(n => typeof n === 'string' && n.trim().length > 0).slice(0, 5);
-        if (names.length > 0) {
-          console.log('[RespondIQ] Auto-identified competitors (direct):', names.join(', '));
-          return names;
-        }
+    // Primary: Robust JSON array extraction (handles fences, preamble, nested brackets)
+    const parsed = extractJSONFromLLM(text, 'array');
+    if (Array.isArray(parsed) && parsed.length > 0) {
+      const names = parsed.filter(n => typeof n === 'string' && n.trim().length > 0).slice(0, 5);
+      if (names.length > 0) {
+        console.log('[RespondIQ] Auto-identified competitors:', names.join(', '));
+        return names;
       }
-    } catch (e) { /* direct parse failed, try regex */ }
-
-    // Attempt 2: Regex extraction of JSON array from within conversational text
-    const arrayMatch = text.match(/\[[\s\S]*?\]/);
-    if (arrayMatch) {
-      try {
-        const names = JSON.parse(arrayMatch[0]);
-        if (Array.isArray(names) && names.length > 0) {
-          const cleaned = names.filter(n => typeof n === 'string' && n.trim().length > 0).slice(0, 5);
-          if (cleaned.length > 0) {
-            console.log('[RespondIQ] Auto-identified competitors (regex):', cleaned.join(', '));
-            return cleaned;
-          }
-        }
-      } catch (e) { /* JSON array regex failed, try conversational fallback */ }
     }
 
-    // Attempt 3: Conversational fallback parser
-    // Handles cases where the LLM outputs numbered lists or prose like:
-    //   "1. Breeze Thru Car Wash\n2. Cobblestone Auto Spa\n3. ..."
-    //   "Here are competitors: Breeze Thru Car Wash, Cobblestone Auto Spa, ..."
+    // Fallback: Conversational parser for numbered lists or prose
     const numberedListNames = [];
     const numberedRegex = /^\s*\d+[\.\)]\s*\*{0,2}(.+?)(?:\*{0,2})\s*(?:[:\-].*)?$/gm;
     let listMatch;
@@ -759,7 +774,10 @@ Return ONLY valid JSON, no markdown, no code fences, no explanation text.`;
     let userPrompt = buildUserPrompt(data, bInfo, months, totalBudgetLow, totalBudgetHigh, totalBudgetMid, keywordData, competitiveIntelBlock);
 
     // ── Inject Website Intelligence into user prompt ──
-    if (websiteIntel.text || websiteIntel.techStack.length || websiteIntel.socialLinks.length) {
+    if (websiteIntel.ssrfBlocked) {
+      // SSRF-blocked URL: do NOT pass the URL or any reference to the blocked endpoint to the AI
+      userPrompt += '\n\nWEBSITE NOTE: The provided website URL could not be accessed (connection refused or unreachable). Generate the plan using only the form data and your industry knowledge. Do NOT reference the specific URL in the plan output.';
+    } else if (websiteIntel.text || websiteIntel.techStack.length || websiteIntel.socialLinks.length) {
       let intel = '\n\n=== WEBSITE INTELLIGENCE (scraped from ' + siteUrl + ') ===\n';
       intel += 'Below is ACTUAL content from the client website. Use this to:\n';
       intel += '1. Understand what the brand ACTUALLY does\n';
@@ -873,7 +891,8 @@ async function scrapeWebsite(url) {
   return {
     text: fullText.length > 3500 ? fullText.substring(0, 3500) + '...' : fullText,
     techStack: allTech,
-    socialLinks: allSocial
+    socialLinks: allSocial,
+    ssrfBlocked: !!homepageResult.ssrfBlocked
   };
 }
 
@@ -882,7 +901,7 @@ async function fetchPage(url) {
   const validation = await validateUrl(url);
   if (!validation.valid) {
     console.warn('[RespondIQ] fetchPage blocked (SSRF):', url, '|', validation.reason);
-    return { text: '', techStack: [], socialLinks: [] };
+    return { text: '', techStack: [], socialLinks: [], ssrfBlocked: true };
   }
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), 8000);
@@ -1006,7 +1025,7 @@ app.post('/api/keyword-ideas', async (req, res) => {
       return res.json({ keywords: [], fallback: true, reason: 'not_configured' });
     }
 
-    const { seedKeywords, pageUrl, location, languageId, maxKeywords } = req.body;
+    const { seedKeywords, pageUrl, location, languageId, maxKeywords, industry } = req.body;
 
     if (!seedKeywords?.length && !pageUrl) {
       return res.status(400).json({ error: 'Provide seedKeywords array or pageUrl' });
@@ -1014,11 +1033,33 @@ app.post('/api/keyword-ideas', async (req, res) => {
 
     console.log('[RespondIQ] Keyword ideas request | seeds:', seedKeywords?.join(', ') || 'none', '| url:', pageUrl || 'none', '| location:', location || 'US');
 
-    const ideas = await getKeywordIdeas(seedKeywords, pageUrl, location, languageId);
+    let ideas = await getKeywordIdeas(seedKeywords, pageUrl, location, languageId);
+
+    // Seed expansion: if results are below minimum, retry with industry + location appended
+    const MIN_KEYWORDS = 5;
+    if (ideas.length < MIN_KEYWORDS && industry && seedKeywords?.length) {
+      const locationName = (location || 'United States').split(',')[0].trim();
+      const industrySeed = industry.toLowerCase().replace(/[^a-z0-9 ]/g, '').trim();
+      const expandedSeeds = [...seedKeywords];
+      if (industrySeed && !expandedSeeds.some(s => s.toLowerCase().includes(industrySeed))) {
+        expandedSeeds.push(industrySeed + ' ' + locationName);
+        expandedSeeds.push(industrySeed + ' services near me');
+      }
+      console.log('[RespondIQ] KW seed expansion: original returned', ideas.length, '| retrying with expanded seeds:', expandedSeeds.join(', '));
+      try {
+        const expandedIdeas = await getKeywordIdeas(expandedSeeds, pageUrl, location, languageId);
+        const seen = new Set(ideas.map(k => k.keyword.toLowerCase()));
+        for (const kw of expandedIdeas) {
+          if (!seen.has(kw.keyword.toLowerCase())) { ideas.push(kw); seen.add(kw.keyword.toLowerCase()); }
+        }
+        console.log('[RespondIQ] KW seed expansion: total after merge:', ideas.length);
+      } catch (e) {
+        console.warn('[RespondIQ] KW seed expansion retry failed:', e.message);
+      }
+    }
 
     // keyword-service.js provides pre-formatted low_cpc/high_cpc strings
     // with correct micros-to-dollars conversion + live exchange rate
-    const MIN_KEYWORDS = 5;
     const MAX_KEYWORDS = 10;
     const requestedLimit = parseInt(maxKeywords, 10) || MAX_KEYWORDS;
     const limit = Math.min(Math.max(requestedLimit, MIN_KEYWORDS), 30);
