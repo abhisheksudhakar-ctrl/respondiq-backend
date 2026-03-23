@@ -50,16 +50,39 @@ function getGeminiClient() {
 // ══════════════════════════════════════════════════════════════
 function extractJSONFromLLM(raw, expectedType) {
   if (!raw || typeof raw !== 'string') return null;
+
   // Step 1: Strip markdown code fences (```json ... ``` or ``` ... ```)
   let text = raw.replace(/^```(?:json)?\s*\n?/gm, '').replace(/\n?```\s*$/gm, '').trim();
-  // Step 2: Try direct parse first (cleanest path)
+
+  // Step 2: Strip any preamble text before the first { or [
+  // Handles "Here is the JSON requested:" and similar conversational wrappers
+  const firstBrace = text.indexOf('{');
+  const firstBracket = text.indexOf('[');
+  if (expectedType === 'object' && firstBrace > 0) {
+    text = text.substring(firstBrace);
+  } else if (expectedType === 'array' && firstBracket > 0) {
+    text = text.substring(firstBracket);
+  } else if (!expectedType) {
+    const earliest = firstBrace >= 0 && firstBracket >= 0
+      ? Math.min(firstBrace, firstBracket)
+      : Math.max(firstBrace, firstBracket);
+    if (earliest > 0) text = text.substring(earliest);
+  }
+
+  // Step 3: Sanitize unescaped control characters inside JSON string values.
+  // Gemini frequently returns literal newlines/tabs inside JSON strings
+  // which breaks JSON.parse(). This escapes them properly.
+  text = sanitizeJSONControlChars(text);
+
+  // Step 4: Try direct parse (cleanest path)
   try {
     const parsed = JSON.parse(text);
     if (expectedType === 'array' && Array.isArray(parsed)) return parsed;
     if (expectedType === 'object' && parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
     if (!expectedType) return parsed;
   } catch (e) { /* direct parse failed, try extraction */ }
-  // Step 3: Brace/bracket-counting extraction for the outermost structure
+
+  // Step 5: Brace/bracket-counting extraction for the outermost structure
   const opener = expectedType === 'array' ? '[' : '{';
   const closer = expectedType === 'array' ? ']' : '}';
   const startIdx = text.indexOf(opener);
@@ -84,6 +107,46 @@ function extractJSONFromLLM(raw, expectedType) {
     }
   }
   return null;
+}
+
+/**
+ * Sanitize unescaped control characters (newlines, tabs, etc.) inside JSON string values.
+ * Walks the string character by character, tracking whether we're inside a quoted value,
+ * and escapes any raw control characters (0x00-0x1F) that aren't already escaped.
+ */
+function sanitizeJSONControlChars(text) {
+  let result = '';
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    const code = text.charCodeAt(i);
+    if (escaped) {
+      result += ch;
+      escaped = false;
+      continue;
+    }
+    if (ch === '\\' && inString) {
+      result += ch;
+      escaped = true;
+      continue;
+    }
+    if (ch === '"') {
+      inString = !inString;
+      result += ch;
+      continue;
+    }
+    // If inside a JSON string and we hit a raw control character, escape it
+    if (inString && code >= 0 && code <= 0x1F) {
+      if (code === 0x0A)      result += '\\n';   // newline
+      else if (code === 0x0D) result += '\\r';   // carriage return
+      else if (code === 0x09) result += '\\t';   // tab
+      else                    result += '\\u' + code.toString(16).padStart(4, '0');
+      continue;
+    }
+    result += ch;
+  }
+  return result;
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -1031,23 +1094,54 @@ app.post('/api/keyword-ideas', async (req, res) => {
       return res.status(400).json({ error: 'Provide seedKeywords array or pageUrl' });
     }
 
-    console.log('[RespondIQ] Keyword ideas request | seeds:', seedKeywords?.join(', ') || 'none', '| url:', pageUrl || 'none', '| location:', location || 'US');
-
-    let ideas = await getKeywordIdeas(seedKeywords, pageUrl, location, languageId);
-
-    // Seed expansion: if results are below minimum, retry with industry + location appended
-    const MIN_KEYWORDS = 5;
-    if (ideas.length < MIN_KEYWORDS && industry && seedKeywords?.length) {
-      const locationName = (location || 'United States').split(',')[0].trim();
-      const industrySeed = industry.toLowerCase().replace(/[^a-z0-9 ]/g, '').trim();
-      const expandedSeeds = [...seedKeywords];
-      if (industrySeed && !expandedSeeds.some(s => s.toLowerCase().includes(industrySeed))) {
-        expandedSeeds.push(industrySeed + ' ' + locationName);
-        expandedSeeds.push(industrySeed + ' services near me');
+    // P1-3: Validate URL before passing to Keyword Planner API
+    // SSRF guard blocks the website scraper, but the same URL was leaking to GKP causing 400 errors
+    let safeUrl = pageUrl || null;
+    if (safeUrl) {
+      const urlCheck = await validateUrl(safeUrl);
+      if (!urlCheck.valid) {
+        console.log('[RespondIQ] KW URL blocked (SSRF):', safeUrl, '|', urlCheck.reason);
+        safeUrl = null; // Strip the URL, proceed with seeds only
       }
+    }
+
+    console.log('[RespondIQ] Keyword ideas request | seeds:', seedKeywords?.join(', ') || 'none', '| url:', safeUrl || 'none', '| location:', location || 'US');
+
+    let ideas = await getKeywordIdeas(seedKeywords, safeUrl, location, languageId);
+
+    // Seed expansion: if results are below minimum, retry with smarter seeds
+    const MIN_KEYWORDS = 5;
+    if (ideas.length < MIN_KEYWORDS && seedKeywords?.length) {
+      const locationName = (location || 'United States').split(',')[0].trim();
+      const expandedSeeds = [...seedKeywords];
+
+      // P1-4: Extract product/service signals from brand name
+      // "Joe's Pizza Palace" -> "pizza", "Sparkle Clean Maids" -> "clean maids"
+      const brandName = (seedKeywords[0] || '').toLowerCase();
+      const brandWords = brandName.replace(/[^a-z0-9 ]/g, '').split(/\s+/).filter(w => w.length > 2);
+      // Common non-descriptive words to skip
+      const stopWords = new Set(['the', 'and', 'for', 'our', 'your', 'inc', 'llc', 'ltd', 'corp', 'company', 'group', 'solutions', 'services', 'enterprises', 'global', 'international', 'test', 'alternative']);
+      const productWords = brandWords.filter(w => !stopWords.has(w));
+
+      // Build context-aware seeds from brand name signals
+      if (productWords.length > 0) {
+        const productPhrase = productWords.slice(-Math.min(productWords.length, 3)).join(' ');
+        expandedSeeds.push(productPhrase + ' ' + locationName);
+        expandedSeeds.push(productPhrase + ' near me');
+      }
+
+      // Also add industry-based seeds (with fixed double-space)
+      if (industry) {
+        const industrySeed = industry.toLowerCase().replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
+        if (industrySeed && !expandedSeeds.some(s => s.toLowerCase().includes(industrySeed))) {
+          expandedSeeds.push(industrySeed + ' ' + locationName);
+          expandedSeeds.push(industrySeed + ' near me');
+        }
+      }
+
       console.log('[RespondIQ] KW seed expansion: original returned', ideas.length, '| retrying with expanded seeds:', expandedSeeds.join(', '));
       try {
-        const expandedIdeas = await getKeywordIdeas(expandedSeeds, pageUrl, location, languageId);
+        const expandedIdeas = await getKeywordIdeas(expandedSeeds, safeUrl, location, languageId);
         const seen = new Set(ideas.map(k => k.keyword.toLowerCase()));
         for (const kw of expandedIdeas) {
           if (!seen.has(kw.keyword.toLowerCase())) { ideas.push(kw); seen.add(kw.keyword.toLowerCase()); }
