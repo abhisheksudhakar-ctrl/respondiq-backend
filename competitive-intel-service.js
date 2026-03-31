@@ -1,237 +1,277 @@
 // ══════════════════════════════════════════════════════════════
-// competitive-intel-service.js
-// Google Ads Transparency Center - FREE Competitive Intelligence
-// Uses Python bridge to reverse-engineered Google internal API
+// competitive-intel-service.js  (v2.0 — Pure Node.js, no Python)
+// Google Ads Transparency Center — FREE Competitive Intelligence
+// Uses native fetch against Google's internal SearchSuggestions API
 // ══════════════════════════════════════════════════════════════
-
-const { execSync } = require('child_process');
-const path = require('path');
-const fs = require('fs');
 
 // ── In-memory cache (competitor data is stable within a day) ──
 const cache = new Map();
 const CACHE_TTL = 12 * 60 * 60 * 1000; // 12 hours
 
-// ── Python scraper script (embedded, auto-written to disk on first call) ──
-const PYTHON_SCRIPT = `
-import sys
-import json
+// ── Session: cookies from adstransparency.google.com ──
+let sessionCookies = '';
+let sessionTimestamp = 0;
+const SESSION_TTL = 30 * 60 * 1000; // Refresh cookies every 30 min
 
-def search_competitor(query):
-    result = {
-        "query": query,
-        "found": False,
-        "best_match": None,
-        "suggestions": []
-    }
+const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
 
-    try:
-        from GoogleAds import GoogleAds
-        a = GoogleAds()
+const COMMON_HEADERS = {
+  'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+  'accept-language': 'en-US,en;q=0.9',
+  'sec-ch-ua': '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+  'sec-ch-ua-mobile': '?0',
+  'sec-ch-ua-platform': '"Windows"',
+  'user-agent': BROWSER_UA,
+};
 
-        suggestions_raw = a.get_all_search_suggestions(query)
-        if not suggestions_raw or not isinstance(suggestions_raw, list):
-            return result
-
-        parsed = []
-        for s in suggestions_raw:
-            info = s.get("1", {})
-            if not info:
-                continue
-            name = info.get("1", "")
-            adv_id = info.get("2", "")
-            country = info.get("3", "")
-            ad_count_raw = info.get("4", {}).get("2", {})
-            ad_count = "0"
-            if isinstance(ad_count_raw, dict):
-                ad_count = ad_count_raw.get("1", "0")
-            verified = info.get("5", False)
-
-            if name and adv_id and adv_id.startswith("AR"):
-                parsed.append({
-                    "name": name,
-                    "advertiser_id": adv_id,
-                    "country": country,
-                    "ad_count": int(ad_count) if str(ad_count).isdigit() else 0,
-                    "verified": bool(verified)
-                })
-
-        result["suggestions"] = parsed
-
-        if not parsed:
-            return result
-
-        # Pick best match: require name similarity AND minimum ad activity
-        # P0-2: Added minimum ad count guard to reject low-activity false positives
-        MIN_ADS_THRESHOLD = 5  # Reject entities with fewer than 5 ads
-        with_meaningful_ads = [p for p in parsed if p["ad_count"] >= MIN_ADS_THRESHOLD]
-        pool = with_meaningful_ads if with_meaningful_ads else []
-
-        # If no entities meet the ad threshold, check if ANY have ads
-        # Only fall back to low-ad entities if the name is an exact or near-exact match
-        if not pool:
-            exact_matches = [p for p in parsed if p["ad_count"] > 0 and
-                             (p["name"].lower().strip() == query_lower or
-                              query_lower.replace('.', '') == p["name"].lower().strip().replace('.', ''))]
-            pool = exact_matches if exact_matches else []
-
-        if not pool:
-            result["found"] = False
-            return result
-
-        query_lower = query.lower().strip()
-        query_words = set(query_lower.split())
-
-        def name_similarity(candidate_name):
-            """Score 0.0 to 1.0 based on how well the candidate name matches the query.
-            Uses bidirectional word overlap and strict guards to reject false positives."""
-            cand_lower = candidate_name.lower().strip()
-            # Exact match (case-insensitive), including with/without dots
-            if cand_lower == query_lower or cand_lower.replace('.','') == query_lower.replace('.',''):
-                return 1.0
-
-            # Common business suffixes that don't change identity
-            biz_suffixes = {'llc', 'inc', 'inc.', 'ltd', 'ltd.', 'co', 'co.', 'corp', 'corp.',
-                           'corporation', 'group', 'the', 'company', 'limited', 'gmbh', 'sa',
-                           'americas', 'america', 'usa', 'us', 'uk', 'international', 'global'}
-
-            shorter = min(len(query_lower), len(cand_lower))
-            longer = max(len(query_lower), len(cand_lower))
-            length_ratio = shorter / longer if longer > 0 else 0
-
-            # Check if query starts the candidate name (strongest positive signal)
-            if cand_lower.startswith(query_lower):
-                # Extra words after query are just business suffixes? High confidence match.
-                extra = cand_lower[len(query_lower):].strip().rstrip('.,')
-                extra_words = set(w.strip('.,') for w in extra.split() if w.strip('.,')) - {''}
-                # Reject if extra words contain long numeric codes (e.g., "5921" in "ORACLE 5921 LLC")
-                # but allow short version numbers like "365" in "Microsoft Dynamics 365"
-                has_random_id = any(w.isdigit() and len(w) >= 4 for w in extra_words)
-                if has_random_id:
-                    return 0.3  # Likely a different entity with same name prefix
-                if not extra_words or extra_words.issubset(biz_suffixes):
-                    return 0.9
-                # Extra words are not just suffixes, but query is still the leading term
-                if length_ratio >= 0.4:
-                    return 0.75
-                return 0.5
-
-            # Query appears inside candidate but NOT at start (e.g., "Padel Oracle")
-            if query_lower in cand_lower:
-                # Penalize heavily: query buried inside an unrelated name
-                if length_ratio >= 0.7:
-                    return 0.65
-                return 0.3
-
-            # Candidate is contained in query (query is longer)
-            if cand_lower in query_lower:
-                if length_ratio >= 0.5:
-                    return 0.7
-                return 0.3
-
-            # Bidirectional word overlap
-            cand_words = set(cand_lower.replace(',', '').replace('.', '').split())
-            noise = {'llc', 'inc', 'ltd', 'co', 'corp', 'corporation', 'group', 'the'}
-            clean_query = query_words - noise
-            clean_cand = cand_words - noise
-            if not clean_query or not clean_cand:
-                return 0.0
-            overlap = clean_query & clean_cand
-            # Forward: what fraction of query words are in candidate?
-            forward = len(overlap) / len(clean_query)
-            # Reverse: what fraction of candidate words are in query?
-            reverse = len(overlap) / len(clean_cand)
-            # Use the minimum to penalize when candidate has many extra words
-            return min(forward, reverse)
-
-        # Filter: require at least 60% bidirectional word overlap to be considered a match
-        MIN_SIMILARITY = 0.6
-        viable = [p for p in pool if name_similarity(p["name"]) >= MIN_SIMILARITY]
-
-        if not viable:
-            # No good name match found despite having suggestions
-            result["found"] = False
-            return result
-
-        best = None
-        for preferred_country in ["US", "GB", "IN", "AE"]:
-            matches = [p for p in viable if p["country"] == preferred_country]
-            if matches:
-                best = sorted(matches, key=lambda x: x["ad_count"], reverse=True)[0]
-                break
-
-        if not best:
-            best = sorted(viable, key=lambda x: x["ad_count"], reverse=True)[0]
-
-        result["found"] = True
-        result["best_match"] = best
-
-    except ImportError:
-        result["error"] = "GoogleAds library not installed. Run: pip install Google-Ads-Transparency-Scraper"
-    except Exception as e:
-        result["error"] = str(e)
-
-    return result
-
-if __name__ == "__main__":
-    query = sys.argv[1] if len(sys.argv) > 1 else ""
-    if query:
-        data = search_competitor(query)
-        print("RESPONDIQ_JSON:" + json.dumps(data))
-    else:
-        print("RESPONDIQ_JSON:" + json.dumps({"error": "No query provided", "found": False}))
-`;
-
-// ── Ensure the Python script file exists ──
-let scriptPath = null;
-
-function ensureScript() {
-  if (scriptPath && fs.existsSync(scriptPath)) return scriptPath;
-  scriptPath = path.join(__dirname, '_google_transparency_scraper.py');
-  fs.writeFileSync(scriptPath, PYTHON_SCRIPT);
-  return scriptPath;
-}
-
-// ── Check if Python + GoogleAds library is available ──
-let pythonAvailable = null;
-
-function checkPythonSetup() {
-  if (pythonAvailable !== null) return pythonAvailable;
-  try {
-    execSync('python3 -c "from GoogleAds import GoogleAds; print(True)"', {
-      timeout: 10000, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe']
-    });
-    pythonAvailable = true;
-    console.log('[RespondIQ] Competitive Intel: Python + GoogleAds library available');
-  } catch (e) {
-    pythonAvailable = false;
-    console.warn('[RespondIQ] Competitive Intel: Python GoogleAds library NOT available. Install with: pip install Google-Ads-Transparency-Scraper');
+// ══════════════════════════════════════════════════════════════
+// Session: grab cookies from the Transparency Center homepage
+// ══════════════════════════════════════════════════════════════
+async function ensureSession() {
+  if (sessionCookies && Date.now() - sessionTimestamp < SESSION_TTL) {
+    return; // Session still fresh
   }
-  return pythonAvailable;
-}
 
-// ══════════════════════════════════════════════════════════════
-// Core: Call Python scraper for a single competitor
-// ══════════════════════════════════════════════════════════════
-function scrapeOneCompetitor(query) {
-  const script = ensureScript();
   try {
-    const output = execSync(
-      `python3 "${script}" "${query.replace(/"/g, '\\"')}"`,
-      { timeout: 20000, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }
-    );
+    console.log('[RespondIQ] Transparency Center: refreshing session cookies...');
+    const res = await fetch('https://adstransparency.google.com/?region=anywhere', {
+      method: 'GET',
+      headers: {
+        ...COMMON_HEADERS,
+        'sec-fetch-dest': 'document',
+        'sec-fetch-mode': 'navigate',
+        'sec-fetch-site': 'none',
+        'sec-fetch-user': '?1',
+        'upgrade-insecure-requests': '1',
+      },
+      redirect: 'follow',
+    });
 
-    // Find our JSON marker in the output (Python lib may print junk before it)
-    const lines = output.split('\n');
-    for (const line of lines) {
-      if (line.startsWith('RESPONDIQ_JSON:')) {
-        return JSON.parse(line.substring('RESPONDIQ_JSON:'.length));
+    // Extract set-cookie headers
+    const rawCookies = res.headers.getSetCookie ? res.headers.getSetCookie() : [];
+    if (rawCookies.length > 0) {
+      sessionCookies = rawCookies.map(c => c.split(';')[0]).join('; ');
+      sessionTimestamp = Date.now();
+      console.log('[RespondIQ] Transparency Center: session established (' + rawCookies.length + ' cookies)');
+    } else {
+      // Fallback: some Node versions don't support getSetCookie()
+      // Try raw header approach
+      const setCookieHeader = res.headers.get('set-cookie') || '';
+      if (setCookieHeader) {
+        sessionCookies = setCookieHeader
+          .split(/,(?=[^ ])/)
+          .map(c => c.split(';')[0].trim())
+          .join('; ');
+        sessionTimestamp = Date.now();
+        console.log('[RespondIQ] Transparency Center: session established (fallback cookie parse)');
+      } else {
+        // Proceed without cookies: Google may still respond
+        sessionCookies = '';
+        sessionTimestamp = Date.now();
+        console.warn('[RespondIQ] Transparency Center: no cookies received, proceeding without session');
       }
     }
+  } catch (err) {
+    console.warn('[RespondIQ] Transparency Center: session init failed:', err.message);
+    // Don't block: set timestamp so we don't retry immediately
+    sessionCookies = '';
+    sessionTimestamp = Date.now();
+  }
+}
 
-    return { query, found: false, error: 'No JSON marker in Python output' };
-  } catch (error) {
-    return { query, found: false, error: error.message?.substring(0, 200) || 'Python execution failed' };
+// ══════════════════════════════════════════════════════════════
+// Core: Query Google's SearchSuggestions API via native fetch
+// ══════════════════════════════════════════════════════════════
+async function fetchSuggestions(query) {
+  await ensureSession();
+
+  const reqBody = JSON.stringify({ '1': query, '2': 10, '3': 10 });
+
+  const headers = {
+    'content-type': 'application/x-www-form-urlencoded',
+    'user-agent': BROWSER_UA,
+    'origin': 'https://adstransparency.google.com',
+    'referer': 'https://adstransparency.google.com/',
+    'sec-fetch-dest': 'empty',
+    'sec-fetch-mode': 'cors',
+    'sec-fetch-site': 'same-origin',
+  };
+  if (sessionCookies) {
+    headers['cookie'] = sessionCookies;
+  }
+
+  const res = await fetch(
+    'https://adstransparency.google.com/anji/_/rpc/SearchService/SearchSuggestions?authuser=0',
+    {
+      method: 'POST',
+      headers,
+      body: new URLSearchParams({ 'f.req': reqBody }),
+    }
+  );
+
+  if (!res.ok) {
+    throw new Error('Transparency API HTTP ' + res.status);
+  }
+
+  const data = await res.json();
+  return data['1'] || [];
+}
+
+// ══════════════════════════════════════════════════════════════
+// Parse raw API response into structured competitor objects
+// ══════════════════════════════════════════════════════════════
+function parseSuggestions(suggestionsRaw) {
+  const parsed = [];
+  if (!suggestionsRaw || !Array.isArray(suggestionsRaw)) return parsed;
+
+  for (const s of suggestionsRaw) {
+    const info = s['1'] || {};
+    if (!info) continue;
+
+    const name = info['1'] || '';
+    const advId = info['2'] || '';
+    const country = info['3'] || '';
+    const adCountRaw = info['4'] && info['4']['2'] ? info['4']['2'] : {};
+    let adCount = 0;
+    if (typeof adCountRaw === 'object' && adCountRaw !== null) {
+      const raw = adCountRaw['1'] || '0';
+      adCount = /^\d+$/.test(String(raw)) ? parseInt(raw, 10) : 0;
+    }
+    const verified = !!info['5'];
+
+    if (name && advId && advId.startsWith('AR')) {
+      parsed.push({ name, advertiser_id: advId, country, ad_count: adCount, verified });
+    }
+  }
+
+  return parsed;
+}
+
+// ══════════════════════════════════════════════════════════════
+// Name similarity scoring (ported from Python, identical logic)
+// ══════════════════════════════════════════════════════════════
+function nameSimilarity(candidateName, queryStr) {
+  const queryLower = queryStr.toLowerCase().trim();
+  const candLower = candidateName.toLowerCase().trim();
+
+  // Exact match (case-insensitive), including with/without dots
+  if (candLower === queryLower || candLower.replace(/\./g, '') === queryLower.replace(/\./g, '')) {
+    return 1.0;
+  }
+
+  const bizSuffixes = new Set([
+    'llc', 'inc', 'inc.', 'ltd', 'ltd.', 'co', 'co.', 'corp', 'corp.',
+    'corporation', 'group', 'the', 'company', 'limited', 'gmbh', 'sa',
+    'americas', 'america', 'usa', 'us', 'uk', 'international', 'global'
+  ]);
+
+  const shorter = Math.min(queryLower.length, candLower.length);
+  const longer = Math.max(queryLower.length, candLower.length);
+  const lengthRatio = longer > 0 ? shorter / longer : 0;
+
+  // Check if query starts the candidate name
+  if (candLower.startsWith(queryLower)) {
+    const extra = candLower.slice(queryLower.length).trim().replace(/[.,]+$/, '');
+    const extraWords = new Set(
+      extra.split(/\s+/).map(w => w.replace(/[.,]/g, '')).filter(Boolean)
+    );
+    // Reject if extra words contain long numeric codes
+    const hasRandomId = [...extraWords].some(w => /^\d+$/.test(w) && w.length >= 4);
+    if (hasRandomId) return 0.3;
+    // Check if extra words are just business suffixes
+    const nonSuffix = [...extraWords].filter(w => !bizSuffixes.has(w.toLowerCase()));
+    if (extraWords.size === 0 || nonSuffix.length === 0) return 0.9;
+    if (lengthRatio >= 0.4) return 0.75;
+    return 0.5;
+  }
+
+  // Query appears inside candidate but NOT at start
+  if (candLower.includes(queryLower)) {
+    if (lengthRatio >= 0.7) return 0.65;
+    return 0.3;
+  }
+
+  // Candidate is contained in query
+  if (queryLower.includes(candLower)) {
+    if (lengthRatio >= 0.5) return 0.7;
+    return 0.3;
+  }
+
+  // Bidirectional word overlap
+  const noise = new Set(['llc', 'inc', 'ltd', 'co', 'corp', 'corporation', 'group', 'the']);
+  const queryWords = new Set(queryLower.split(/\s+/).filter(w => !noise.has(w)));
+  const candWords = new Set(candLower.replace(/[.,]/g, '').split(/\s+/).filter(w => !noise.has(w)));
+
+  if (queryWords.size === 0 || candWords.size === 0) return 0.0;
+
+  const overlap = [...queryWords].filter(w => candWords.has(w));
+  const forward = overlap.length / queryWords.size;
+  const reverse = overlap.length / candWords.size;
+  return Math.min(forward, reverse);
+}
+
+// ══════════════════════════════════════════════════════════════
+// Best-match selection logic (ported from Python, identical)
+// ══════════════════════════════════════════════════════════════
+function selectBestMatch(parsed, query) {
+  if (!parsed || parsed.length === 0) return null;
+
+  const queryLower = query.toLowerCase().trim();
+  const MIN_ADS_THRESHOLD = 5;
+  const MIN_SIMILARITY = 0.6;
+
+  // Pool: entities with meaningful ad counts
+  let pool = parsed.filter(p => p.ad_count >= MIN_ADS_THRESHOLD);
+
+  // Fallback: if no entities meet threshold, check exact/near-exact with any ads
+  if (pool.length === 0) {
+    pool = parsed.filter(p => {
+      if (p.ad_count <= 0) return false;
+      const pLower = p.name.toLowerCase().trim();
+      return pLower === queryLower || pLower.replace(/\./g, '') === queryLower.replace(/\./g, '');
+    });
+  }
+
+  if (pool.length === 0) return null;
+
+  // Filter by name similarity
+  const viable = pool.filter(p => nameSimilarity(p.name, query) >= MIN_SIMILARITY);
+  if (viable.length === 0) return null;
+
+  // Prefer US > GB > IN > AE, then highest ad count
+  for (const preferredCountry of ['US', 'GB', 'IN', 'AE']) {
+    const matches = viable.filter(p => p.country === preferredCountry);
+    if (matches.length > 0) {
+      return matches.sort((a, b) => b.ad_count - a.ad_count)[0];
+    }
+  }
+
+  // No preferred country match: pick highest ad count globally
+  return viable.sort((a, b) => b.ad_count - a.ad_count)[0];
+}
+
+// ══════════════════════════════════════════════════════════════
+// Core: Search for a single competitor (replaces scrapeOneCompetitor)
+// ══════════════════════════════════════════════════════════════
+async function searchOneCompetitor(query) {
+  try {
+    const suggestionsRaw = await fetchSuggestions(query);
+    const parsed = parseSuggestions(suggestionsRaw);
+
+    if (parsed.length === 0) {
+      return { query, found: false, best_match: null, suggestions: [] };
+    }
+
+    const best = selectBestMatch(parsed, query);
+
+    return {
+      query,
+      found: !!best,
+      best_match: best || null,
+      suggestions: parsed,
+    };
+  } catch (err) {
+    return { query, found: false, best_match: null, error: err.message };
   }
 }
 
@@ -241,16 +281,6 @@ function scrapeOneCompetitor(query) {
 async function getCompetitiveIntelligence(competitorNames) {
   if (!competitorNames || competitorNames.length === 0) return [];
 
-  // Check if Python setup is available
-  if (!checkPythonSetup()) {
-    console.warn('[RespondIQ] Skipping competitive intel (Python not configured)');
-    return competitorNames.map(name => ({
-      query: name.trim(),
-      found: false,
-      reason: 'Python GoogleAds library not installed on server',
-    }));
-  }
-
   const results = [];
 
   for (const name of competitorNames) {
@@ -258,7 +288,6 @@ async function getCompetitiveIntelligence(competitorNames) {
     if (!cleaned) continue;
 
     // Remove protocol/www but KEEP domain suffix for first attempt
-    // "Monday.com" should search as "Monday.com" first, not just "Monday"
     const cleanedFull = cleaned
       .replace(/^https?:\/\//, '')
       .replace(/^www\./, '');
@@ -275,15 +304,13 @@ async function getCompetitiveIntelligence(competitorNames) {
       continue;
     }
 
-    // Try full name first (e.g., "Monday.com"), then short name (e.g., "Monday") if no good match
-    let searchQuery = cleanedFull;
-    console.log('[RespondIQ] Querying Google Ads Transparency for:', searchQuery);
-    let raw = scrapeOneCompetitor(searchQuery);
+    // Try full name first, then short name if no match
+    console.log('[RespondIQ] Querying Google Ads Transparency for:', cleanedFull);
+    let raw = await searchOneCompetitor(cleanedFull);
 
-    // If full name didn't find a good match and short name is different, try short
     if ((!raw.found || !raw.best_match) && cleanedShort !== cleanedFull) {
       console.log('[RespondIQ] Retrying Transparency with shorter query:', cleanedShort);
-      raw = scrapeOneCompetitor(cleanedShort);
+      raw = await searchOneCompetitor(cleanedShort);
     }
 
     let structured;
@@ -326,7 +353,7 @@ async function getCompetitiveIntelligence(competitorNames) {
     cache.set(cacheKey, { data: structured, timestamp: Date.now() });
     results.push(structured);
 
-    // Rate limit between Python calls
+    // Rate limit between API calls (be respectful to Google)
     if (competitorNames.indexOf(name) < competitorNames.length - 1) {
       await new Promise(r => setTimeout(r, 500));
     }
@@ -337,6 +364,7 @@ async function getCompetitiveIntelligence(competitorNames) {
 
 // ══════════════════════════════════════════════════════════════
 // Build the prompt injection block for the AI model
+// (Unchanged from v1)
 // ══════════════════════════════════════════════════════════════
 function buildCompetitorPromptBlock(results) {
   if (!results || results.length === 0) return '';
