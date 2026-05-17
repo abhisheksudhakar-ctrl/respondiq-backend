@@ -1335,7 +1335,7 @@ async function createRespondIqPptxBuffer(data, plan) {
     const options = {
       bold: !!opts.bold,
       color: opts.color || palette.ink,
-      margin: 0.05,
+      margin: opts.margin ?? 0.04,
       valign: 'top'
     };
     if (opts.fill) options.fill = { color: opts.fill };
@@ -1347,8 +1347,8 @@ async function createRespondIqPptxBuffer(data, plan) {
   }
 
   function addTable(slide, columns, rows, x, y, w, h, colW, accent = palette.navy, opts = {}) {
-    const header = columns.map(col => tableCell(col, { bold: true, color: accent, fill: opts.headerFill || palette.gray, max: 38, fontSize: opts.headerSize || 7.3 }));
-    const body = rows.map(row => row.map(cell => tableCell(cell, { max: opts.cellMax || 110, fontSize: opts.fontSize || 7.1 })));
+    const header = columns.map(col => tableCell(col, { bold: true, color: accent, fill: opts.headerFill || palette.gray, max: opts.headerMax || 38, fontSize: opts.headerSize || 7.3, margin: opts.margin }));
+    const body = rows.map(row => row.map(cell => tableCell(cell, { max: opts.cellMax || 110, fontSize: opts.fontSize || 7.1, margin: opts.margin })));
     slide.addTable([header, ...body], {
       x, y, w, h,
       colW,
@@ -1366,7 +1366,11 @@ async function createRespondIqPptxBuffer(data, plan) {
     if (!safeRows.length) return;
     chunk(safeRows, rowsPerSlide).forEach((part, idx) => {
       const slide = newSlide(section, idx ? title + ' (cont.)' : title, accent);
-      addTable(slide, columns, part, 0.62, 1.62, 12.1, 4.95, colW, accent, opts);
+      const tableH = opts.tableHeight || Math.min(
+        opts.maxTableHeight || 4.95,
+        Math.max(opts.minTableHeight || 1.15, (opts.headerRowHeight || 0.38) + part.length * (opts.rowHeight || 0.44))
+      );
+      addTable(slide, columns, part, 0.62, 1.62, 12.1, tableH, colW, accent, opts);
     });
   }
 
@@ -1519,7 +1523,7 @@ async function createRespondIqPptxBuffer(data, plan) {
 
   function drawBenchmarks() {
     const rows = asArray(p.benchmarks).map(b => [b.metric, b.plan_target, b.industry_avg, b.vs_benchmark]);
-    addTableSlides('Section 16', 'Industry Benchmark Comparison', ['Metric', 'Plan Target', 'Industry Avg', 'vs. Benchmark'], rows, [2.8, 2.2, 2.8, 4.3], palette.teal, 7, { fontSize: 6.8, cellMax: 100, headerFill: 'E9F4FF' });
+    addTableSlides('Section 16', 'Industry Benchmark Comparison', ['Metric', 'Plan Target', 'Industry Avg', 'vs. Benchmark'], rows, [2.8, 2.2, 2.8, 4.3], palette.teal, 10, { fontSize: 6.3, headerSize: 6.7, cellMax: 115, headerFill: 'E9F4FF', rowHeight: 0.33, headerRowHeight: 0.34, maxTableHeight: 4.6 });
   }
 
   function drawKeywords() {
@@ -1529,13 +1533,13 @@ async function createRespondIqPptxBuffer(data, plan) {
       kw.competition,
       [kw.low_cpc, kw.high_cpc].filter(Boolean).join(' - ') || 'N/A'
     ]);
-    addTableSlides('Section 17', 'Search Keyword Recommendations', ['Keyword', 'Avg. Monthly Searches', 'Competition', 'Est. CPC Range'], rows, [4.2, 2.7, 2.0, 3.2], palette.navy, 8, { fontSize: 6.9, cellMax: 95 });
+    addTableSlides('Section 17', 'Search Keyword Recommendations', ['Keyword', 'Avg. Monthly Searches', 'Competition', 'Est. CPC Range'], rows, [4.35, 2.55, 1.85, 3.35], palette.navy, 10, { fontSize: 6.1, headerSize: 6.5, cellMax: 115, headerMax: 44, rowHeight: 0.32, headerRowHeight: 0.34, maxTableHeight: 4.55 });
   }
 
   function drawFlightPlan() {
     const flight = inferFlightColumns(d.campaignDuration);
     const rows = asArray(p.flight_plan).map(fp => [fp.channel, ...flight.keys.map(k => fp[k] || '-')]);
-    addTableSlides('Section 07', 'Flight Plan and Calendar', ['Channel', ...flight.headers], rows, [2.1, 2.5, 2.5, 2.5, 2.5], palette.orange, 6, { fontSize: 6.3, cellMax: 95, headerFill: 'FFF1EB' });
+    addTableSlides('Section 07', 'Flight Plan and Calendar', ['Channel', ...flight.headers], rows, [1.65, 2.6, 2.6, 2.6, 2.65], palette.orange, 4, { fontSize: 5.45, headerSize: 6.1, cellMax: 260, headerMax: 44, headerFill: 'FFF1EB', tableHeight: 5.3, margin: 0.035 });
   }
 
   function drawRecommendations() {

@@ -330,6 +330,12 @@ function getActivityLevel(adCount) {
          adCount > 0 ? 'Low' : 'None Detected';
 }
 
+function getDirectionalActivityTier(adCount) {
+  return adCount > 500 ? 'High' :
+         adCount > 50 ? 'Medium' :
+         adCount > 0 ? 'Low' : 'None';
+}
+
 function buildEstimatedChannels(adCount) {
   const channels = ['Google Search'];
   if (adCount > 20) channels.push('Google Display Network');
@@ -393,14 +399,18 @@ function hasManagedServicesRiskLanguage(value) {
     'advertising',
     'consulting',
     'consultants',
+    'digital',
     'group',
     'holdings',
+    'interactive',
     'management',
     'marketing',
     'media',
     'partners',
+    'performance',
     'services',
     'solutions',
+    'strategy',
   ]);
   return [...riskTerms].some(term => tokens.has(term));
 }
@@ -409,7 +419,7 @@ function qualifyBrandAdOwnership(query, match) {
   const accountAdCount = Number(match.ad_count || 0);
   const similarity = nameSimilarity(match.name || '', query || '');
   const agencyLike = hasAgencyAccountLanguage(query) || hasAgencyAccountLanguage(match.name);
-  const highVolumeManagedAccountRisk = accountAdCount >= 5000 && (
+  const highVolumeManagedAccountRisk = accountAdCount >= 250 && (
     hasManagedServicesRiskLanguage(query) || hasManagedServicesRiskLanguage(match.name)
   );
 
@@ -452,6 +462,9 @@ function qualifyBrandAdOwnership(query, match) {
     ad_count: brandRelevantAdCount,
     ad_count_weight: Number(adCountWeight.toFixed(2)),
     ad_count_scope: adCountScope,
+    exact_ad_count_allowed: adCountScope === 'brand_owned_verified' && ownershipConfidence === 'high',
+    ad_count_display_mode: adCountScope === 'brand_owned_verified' && ownershipConfidence === 'high' ? 'count' : 'tier',
+    google_activity_tier: getDirectionalActivityTier(adCountScope === 'brand_owned_verified' ? brandRelevantAdCount : accountAdCount),
     brand_relevance: brandRelevance,
     ownership_confidence: ownershipConfidence,
     name_match_score: Number(similarity.toFixed(2)),
@@ -589,6 +602,9 @@ async function getCompetitiveIntelligence(competitorNames, locations = ['United 
         ad_count: adCount,
         ad_count_weight: ownership.ad_count_weight,
         ad_count_scope: ownership.ad_count_scope,
+        exact_ad_count_allowed: ownership.exact_ad_count_allowed,
+        ad_count_display_mode: ownership.ad_count_display_mode,
+        google_activity_tier: ownership.google_activity_tier,
         brand_relevance: ownership.brand_relevance,
         ownership_confidence: ownership.ownership_confidence,
         name_match_score: ownership.name_match_score,
@@ -642,21 +658,25 @@ function buildCompetitorPromptBlock(results) {
   if (found.length === 0) return '';
 
   let block = '\nRULE 16 — REAL-TIME COMPETITIVE AD INTELLIGENCE (from Google Ads Transparency Center):\n';
-  block += 'The following competitor data was auto-retrieved from Google\'s public Ads Transparency database. Google verifies the advertiser account/profile and account-level active ad totals. RespondIQ also applies a brand-relevance weighting layer so agency or multi-brand account totals do not get treated as fully brand-owned activity.\n\n';
+  block += 'The following competitor data was auto-retrieved from Google\'s public Ads Transparency database. Google verifies the advertiser account/profile, but advertiser profiles can include ads run for client brands. For agency, media, consulting, or multi-brand profiles, use only a directional activity tier and never treat the profile-level ad total as brand-owned activity.\n\n';
 
   for (const comp of found) {
+    const allowExactCount = comp.exact_ad_count_allowed !== false && (comp.ad_count_display_mode || 'count') === 'count';
     block += `VERIFIED: ${comp.name} (${comp.country})\n`;
     block += `- Google Ads Transparency advertiser ID: ${comp.advertiser_id}\n`;
-    block += `- Account-level active Google ads: ${comp.account_ad_count ?? comp.ad_count}\n`;
-    block += `- Brand-relevant weighted Google ads: ${comp.ad_count}\n`;
     block += `- Ad count scope: ${comp.ad_count_scope || 'brand_owned_verified'}\n`;
     block += `- Ownership confidence: ${comp.ownership_confidence || 'high'}\n`;
     block += `- Name match score: ${comp.name_match_score ?? 'n/a'}\n`;
+    if (allowExactCount) {
+      block += `- Brand-owned active Google ads: ${comp.ad_count}\n`;
+    } else {
+      block += `- Directional Google activity tier: ${comp.google_activity_tier || comp.activity_level || 'Medium'}\n`;
+      block += '- Exact Google ad count: withheld from narrative because this profile may include client or third-party ads\n';
+    }
     if (comp.qualification_note) {
       block += `- Qualification note: ${comp.qualification_note}\n`;
     }
-    block += `- Account activity level: ${comp.account_activity_level || comp.activity_level}\n`;
-    block += `- Brand-relevant activity level: ${comp.activity_level}\n`;
+    block += `- Google activity level for planning: ${allowExactCount ? comp.activity_level : (comp.google_activity_tier || comp.activity_level)}\n`;
     block += `- Google-verified advertiser: ${comp.verified ? 'Yes' : 'No'}\n`;
     block += `- Estimated Google channels: ${comp.estimated_channels.join(', ')}\n`;
     if (Array.isArray(comp.transparency_urls) && comp.transparency_urls.length > 0) {
@@ -671,12 +691,13 @@ function buildCompetitorPromptBlock(results) {
   }
 
   block += 'INSTRUCTIONS FOR USING THIS DATA:\n';
-  block += '- Reference the brand-relevant weighted Google ad count in the competitive_sov section\n';
-  block += '- Use brand-relevant activity levels to estimate relative spend (High activity = likely higher spend)\n';
-  block += '- Do not inflate SOV or spend from raw account-level totals when ad_count_scope is "account_level_weighted"\n';
-  block += '- If ownership confidence is medium or low, explicitly note that the Google account-level count may include client or third-party ads\n';
+  block += '- Reference exact Google ad counts ONLY when exact_ad_count_allowed is true\n';
+  block += '- When exact_ad_count_allowed is false, use only High/Medium/Low Google activity wording; do NOT write a numeric Google ad count anywhere in the plan\n';
+  block += '- Use directional activity tiers to estimate relative spend (High activity = likely higher spend), but keep SOV and spend estimates conservative for agency-style accounts\n';
+  block += '- Do not inflate SOV or spend from raw account-level totals when ad_count_scope is not "brand_owned_verified"\n';
+  block += '- If ownership confidence is medium or low, explicitly note that the Google advertiser profile may include client or third-party ads\n';
   block += '- Treat agency or multi-brand profiles as directional competitive signals unless the source link clearly shows brand-owned creative\n';
-  block += '- Label account/profile source data as "verified via Google Ads Transparency"; label weighted brand-relevant counts as "qualified/weighted by RespondIQ" when ownership confidence is not high\n';
+  block += '- Label account/profile source data as "verified via Google Ads Transparency"; label non-exact activity tiers as "directional due to possible client ads"\n';
   block += '- This covers Google platforms ONLY. For Meta, LinkedIn, TikTok channels, supplement with industry knowledge and label as "estimated"\n';
   block += '- Set ai_data_confidence to "medium" when Transparency data is available (upgrade from "low")\n';
 
