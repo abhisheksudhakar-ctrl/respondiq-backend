@@ -877,7 +877,7 @@ function createRespondIqPdfBuffer(data, plan) {
     doc.font('Helvetica').fontSize(12).fillColor(palette.muted).text('Prepared for ' + brand, state.left, midY + 58, { align: 'center', width: state.width });
     card(state.left + 72, midY + 105, state.width - 144, 102, '#fff7ed', '#ffd7c2');
     doc.font('Helvetica-Bold').fontSize(9).fillColor(palette.navy).text('NEED DEEPER STRATEGY OR FULL-SERVICE EXECUTION?', state.left + 92, midY + 128, { width: state.width - 184, align: 'center' });
-    doc.font('Helvetica-Bold').fontSize(14).fillColor(palette.orange).text('hello@responsivemts.com', state.left + 92, midY + 155, { width: state.width - 184, align: 'center' });
+    doc.font('Helvetica-Bold').fontSize(14).fillColor(palette.orange).text('info@responsivemts.com', state.left + 92, midY + 155, { width: state.width - 184, align: 'center' });
     doc.font('Helvetica').fontSize(10).fillColor(palette.muted).text('responsivemts.com', state.left + 92, midY + 179, { width: state.width - 184, align: 'center' });
     doc.rect(state.left + 145, doc.page.height - 92, state.width - 290, 2).fill(palette.orange);
   }
@@ -1561,7 +1561,7 @@ async function createRespondIqPptxBuffer(data, plan) {
     addText(slide, 'Prepared for ' + brand, 0.62, 3.78, 12.1, 0.25, { fontSize: 12, color: palette.muted, align: 'center', margin: 0 });
     addRect(slide, 4.0, 4.62, 5.33, 0.9, 'FFF7ED', 'FFD7C2');
     addText(slide, 'NEED DEEPER STRATEGY OR FULL-SERVICE EXECUTION?', 4.12, 4.84, 5.1, 0.16, { fontSize: 7.5, color: palette.navy, bold: true, align: 'center', margin: 0 });
-    addText(slide, 'hello@responsivemts.com', 4.12, 5.12, 5.1, 0.2, { fontSize: 12, color: palette.orange, bold: true, align: 'center', margin: 0 });
+    addText(slide, 'info@responsivemts.com', 4.12, 5.12, 5.1, 0.2, { fontSize: 12, color: palette.orange, bold: true, align: 'center', margin: 0 });
   }
 
   drawCover();
