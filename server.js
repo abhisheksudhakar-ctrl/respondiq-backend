@@ -264,6 +264,242 @@ const FUNNEL_GUIDE = {
   'Event Promotion': 'Funnel split: 40% awareness, 40% consideration, 20% conversion. Time-sensitive, heavy first 60% of timeline, countdown urgency. Focus on social, search, email, geo-targeted.'
 };
 
+function normalizeActivityTier(value, count) {
+  const text = String(value || '').toLowerCase();
+  const n = Number(count || 0);
+  if (/very high|high/.test(text) || n > 100) return 'High';
+  if (/moderate|medium|active/.test(text) || n > 20) return 'Medium';
+  if (/low/.test(text) || n > 0) return 'Low';
+  return 'Nil';
+}
+
+function activityLabel(tier) {
+  return tier === 'Nil' ? 'Nil ad activity' : tier + ' ad activity';
+}
+
+function activityScore(tier) {
+  if (tier === 'High') return 3;
+  if (tier === 'Medium') return 2;
+  if (tier === 'Low') return 1;
+  return 0;
+}
+
+function benchmarkKeyForIndustry(industry) {
+  const raw = String(industry || '').toLowerCase();
+  if (!raw) return null;
+  for (const [key, val] of Object.entries(BENCHMARKS)) {
+    if (raw.includes(key.replace(/_/g, ' ')) || raw.includes(String(val.label || '').toLowerCase())) return key;
+  }
+  if (/e.?commerce|retail|dtc|shop/.test(raw)) return 'ecommerce';
+  if (/legal|law/.test(raw)) return 'legal';
+  if (/real estate|property/.test(raw)) return 'real_estate';
+  if (/health|medical|dental|clinic/.test(raw)) return 'healthcare';
+  if (/finance|financial|insurance|bank/.test(raw)) return 'finance';
+  if (/b2b|saas|software|technology|tech/.test(raw)) return 'b2b_saas';
+  if (/education|school|university/.test(raw)) return 'education';
+  if (/home|local service|contractor/.test(raw)) return 'home_services';
+  if (/travel|hotel|hospitality/.test(raw)) return 'travel';
+  if (/automotive|auto|car/.test(raw)) return 'automotive';
+  if (/restaurant|food/.test(raw)) return 'restaurants';
+  if (/fitness|wellness/.test(raw)) return 'fitness';
+  if (/non.?profit|charity/.test(raw)) return 'nonprofit';
+  return null;
+}
+
+function benchmarkChannelForPlatform(platform) {
+  const p = String(platform || '').toLowerCase();
+  if (/search|google ads/.test(p)) return 'google_search';
+  if (/display|gdn/.test(p)) return 'google_display';
+  if (/instagram/.test(p)) return 'instagram';
+  if (/facebook|meta/.test(p)) return 'meta';
+  if (/linkedin/.test(p)) return 'linkedin';
+  if (/tiktok/.test(p)) return 'tiktok';
+  if (/youtube/.test(p)) return 'youtube';
+  if (/programmatic|native|display/.test(p)) return 'programmatic';
+  return null;
+}
+
+function averageBenchmarkMetric(industry, platform, metric) {
+  const key = benchmarkKeyForIndustry(industry);
+  const data = key ? BENCHMARKS[key] : null;
+  if (!data || !data.channels) return null;
+  const requested = String(platform || '').split(',').map(benchmarkChannelForPlatform).filter(Boolean);
+  const channels = requested.length ? requested : Object.keys(data.channels);
+  const values = channels
+    .map(ch => data.channels[ch] && data.channels[ch][metric])
+    .filter(v => Number.isFinite(Number(v)) && Number(v) > 0)
+    .map(Number);
+  if (!values.length) return null;
+  return values.reduce((sum, val) => sum + val, 0) / values.length;
+}
+
+function parseHistoricalPerformance(value) {
+  const text = String(value || '').trim();
+  if (!text) return null;
+  let match = text.match(/CPA\s+under\s+\$?([\d.]+)/i);
+  if (match) return { metric: 'CPA', label: 'Avg CPA under $' + match[1], high: Number(match[1]), bucket: text };
+  match = text.match(/CPA\s+\$?([\d.]+)\s*-\s*\$?([\d.]+)/i);
+  if (match) return { metric: 'CPA', label: 'Avg CPA $' + match[1] + '-$' + match[2], low: Number(match[1]), high: Number(match[2]), bucket: text };
+  match = text.match(/CPA\s+over\s+\$?([\d.]+)/i);
+  if (match) return { metric: 'CPA', label: 'Avg CPA over $' + match[1], low: Number(match[1]), bucket: text };
+  match = text.match(/ROAS\s+([\d.]+):1\s*-\s*([\d.]+):1/i);
+  if (match) return { metric: 'ROAS', label: 'ROAS ' + match[1] + ':1-' + match[2] + ':1', low: Number(match[1]), high: Number(match[2]), bucket: text };
+  match = text.match(/ROAS\s+([\d.]+):1\+/i);
+  if (match) return { metric: 'ROAS', label: 'ROAS ' + match[1] + ':1+', low: Number(match[1]), bucket: text };
+  return { metric: 'Other', label: text, bucket: text };
+}
+
+function roundMoney(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  if (n >= 100) return Math.round(n / 5) * 5;
+  return Math.round(n);
+}
+
+function buildCompetitivePressureSignal(googleResults, metaResults) {
+  const rows = [];
+  (Array.isArray(googleResults) ? googleResults : []).forEach(r => {
+    if (!r || !r.found) return;
+    const tier = normalizeActivityTier(r.google_activity_tier || r.activity_level, r.ad_count || r.account_ad_count || r.raw_ad_count);
+    rows.push({ source: 'Google Ads Transparency Center', brand: r.name || r.query, tier, score: activityScore(tier) });
+  });
+  (Array.isArray(metaResults) ? metaResults : []).forEach(r => {
+    if (!r || !r.found) return;
+    const tier = normalizeActivityTier(r.activity_level, r.ad_count);
+    rows.push({ source: 'Meta Ad Library', brand: r.page_name || r.query, tier, score: activityScore(tier) });
+  });
+
+  const totalScore = rows.reduce((sum, row) => sum + row.score, 0);
+  let level = 'Nil';
+  if (totalScore >= 8 || rows.filter(r => r.tier === 'High').length >= 2) level = 'High';
+  else if (totalScore >= 4 || rows.some(r => r.tier === 'High')) level = 'Medium';
+  else if (totalScore > 0) level = 'Low';
+
+  const rateAdjustmentPct = level === 'High' ? 15 : level === 'Medium' ? 8 : level === 'Low' ? 3 : 0;
+  return {
+    level,
+    label: activityLabel(level),
+    rate_adjustment_pct: rateAdjustmentPct,
+    verified_sources: rows.length,
+    high_activity_competitors: rows.filter(r => r.tier === 'High').length,
+    summary: rows.length
+      ? `${activityLabel(level)} across ${rows.length} verified source match${rows.length === 1 ? '' : 'es'}; model CPC/CPM sensitivity at +${rateAdjustmentPct}%.`
+      : 'No verified active ad-library signal found; do not claim competitor inactivity unless a source explicitly reports zero active ads.',
+    rows
+  };
+}
+
+function buildCampaignCalibrationSignal(data, pressure) {
+  const historical = parseHistoricalPerformance(data.pastPerformance);
+  if (!historical) return null;
+  const pressureMultiplier = 1 + ((pressure && pressure.rate_adjustment_pct) || 0) / 100;
+
+  if (historical.metric === 'CPA') {
+    const benchmarkCpa = averageBenchmarkMetric(data.industry, data.platform, 'cpa');
+    const adjustedBenchmark = benchmarkCpa ? benchmarkCpa * pressureMultiplier : null;
+    let target = null;
+    let beatSupported = false;
+    let logic = '';
+
+    if (historical.high) {
+      beatSupported = !!adjustedBenchmark && adjustedBenchmark <= historical.high * 0.9;
+      if (beatSupported) {
+        target = roundMoney(Math.min(adjustedBenchmark * 0.98, historical.high * 0.92));
+        logic = `Benchmarks support beating the reported business-level CPA bucket; use a precise modeled launch target of $${target}.`;
+      } else {
+        target = roundMoney(adjustedBenchmark || historical.high);
+        logic = `Do not copy "${historical.bucket}" as the target. Treat it as a blended historical baseline; paid-media benchmarks support a precise modeled launch target of $${target}.`;
+      }
+    } else if (historical.low) {
+      target = roundMoney(adjustedBenchmark || historical.low * 0.85);
+      beatSupported = !!adjustedBenchmark && adjustedBenchmark < historical.low;
+      logic = `Historical CPA is above $${historical.low}; use a precise modeled launch target of $${target} and frame it as an improvement path.`;
+    }
+
+    return {
+      metric: 'CPA',
+      reported_label: historical.label,
+      reported_bucket: historical.bucket,
+      benchmark_reference: adjustedBenchmark ? '$' + roundMoney(adjustedBenchmark) : 'industry benchmark unavailable',
+      modeled_target: target ? '$' + target : '',
+      modeled_target_value: target,
+      beat_supported: beatSupported,
+      logic
+    };
+  }
+
+  if (historical.metric === 'ROAS') {
+    const benchmarkRoas = averageBenchmarkMetric(data.industry, data.platform, 'roas') || null;
+    let target = benchmarkRoas || (historical.high ? (historical.low + historical.high) / 2 : historical.low || 3);
+    let beatSupported = false;
+    if (historical.high && benchmarkRoas && benchmarkRoas > historical.high * 1.1) {
+      beatSupported = true;
+      target = benchmarkRoas;
+    } else if (historical.high) {
+      target = Math.min(target, historical.high);
+    }
+    target = Math.round(target * 10) / 10;
+    return {
+      metric: 'ROAS',
+      reported_label: historical.label,
+      reported_bucket: historical.bucket,
+      benchmark_reference: benchmarkRoas ? benchmarkRoas.toFixed(1) + ':1' : 'industry benchmark unavailable',
+      modeled_target: target.toFixed(1) + ':1',
+      modeled_target_value: target,
+      beat_supported: beatSupported,
+      logic: beatSupported
+        ? `Benchmarks support a precise ROAS target above the reported range: ${target.toFixed(1)}:1.`
+        : `Use ${target.toFixed(1)}:1 as the precise ROAS target; do not copy the reported range as the plan target.`
+    };
+  }
+
+  return {
+    metric: historical.metric,
+    reported_label: historical.label,
+    reported_bucket: historical.bucket,
+    logic: 'Use this as context only; do not repeat it as a performance target without modeling a precise KPI.'
+  };
+}
+
+function buildPlanningSignals(data, googleResults, metaResults) {
+  const competitivePressure = buildCompetitivePressureSignal(googleResults, metaResults);
+  const campaignCalibration = buildCampaignCalibrationSignal(data, competitivePressure);
+  if (!campaignCalibration && competitivePressure.level === 'Nil' && !data.webTraffic && !data.salesCycle && !data.crmTool && !data.creativeAssets) {
+    return null;
+  }
+  return {
+    campaign_calibration: campaignCalibration,
+    competitive_pressure: competitivePressure,
+    website_traffic_signal: data.webTraffic || '',
+    sales_cycle_signal: data.salesCycle || '',
+    crm_signal: data.crmTool || '',
+    creative_signal: data.creativeAssets || ''
+  };
+}
+
+function buildPlanningSignalsPromptBlock(signals) {
+  if (!signals) return '';
+  const calibration = signals.campaign_calibration;
+  const pressure = signals.competitive_pressure;
+  let block = '\nRULE 20 — CAMPAIGN INTELLIGENCE CALIBRATION + COMPETITIVE PRESSURE:\n';
+  block += 'Use the structured planning signals below to shape strategy, benchmarks, KPIs, recommendations, risks, and narrative. These are not decorative data points.\n';
+  if (calibration) {
+    block += `- Reported historical baseline: ${calibration.reported_label}. Treat this as broad business-level context unless the user says it is platform-specific.\n`;
+    if (calibration.modeled_target) {
+      block += `- Required precise modeled target: ${calibration.modeled_target} ${calibration.metric}. Do NOT copy the bucket "${calibration.reported_bucket}" as the target.\n`;
+      block += `- Beat historical only when benchmark-supported: ${calibration.beat_supported ? 'yes' : 'no'}. ${calibration.logic}\n`;
+      block += '- Include a visible "Reported Historical Baseline" note in objectives or recommendations explaining how the plan target was calibrated.\n';
+    }
+  }
+  if (pressure) {
+    block += `- Competitive pressure: ${pressure.label}. Verified source matches: ${pressure.verified_sources}. CPC/CPM sensitivity adjustment: +${pressure.rate_adjustment_pct}%.\n`;
+    block += '- Show this as a visible planning signal in the plan. Use it to explain rate pressure, share-of-voice risk, conquesting difficulty, and monitoring needs.\n';
+    block += '- Do NOT write exact competitor ad counts in the plan. Use only: High ad activity, Medium ad activity, Low ad activity, or Nil ad activity.\n';
+  }
+  block += 'Output precise KPI values like "$18 CPA" or "$26 CPA"; never output vague copied buckets like "under $20 CPA" as the plan target.\n';
+  return block;
+}
+
 function buildSystemPrompt(data) {
   return `You are a senior media planner at a top agency preparing a real client deliverable. You must return ONLY valid JSON, no markdown, no code fences, no explanation text.
 
@@ -277,7 +513,8 @@ ABSOLUTE RULES YOU CANNOT BREAK:
 7. Channel tactics must be specific and actionable, not generic
 8. KPI targets must be realistic numbers based on industry benchmarks for ${data.industry}
 9. If website content is provided, READ IT CAREFULLY to understand what the business actually does before selecting competitors. The website content is the #1 source of truth for competitor matching.
-10. For every CPM, CPC, CTR, and industry benchmark figure, you MUST use your search capability to look up current rates before writing any number. Search for "[industry] average CPM 2025", "[channel] advertising benchmark [industry] 2025", "average CPC [channel] [industry]", and equivalent queries. Use ONLY search-verified rates, never use memorised training data for cost figures. If search returns a range, use the midpoint. Every benchmark in the benchmarks array must reference a figure you verified via search, not estimated from memory.`;
+10. For every CPM, CPC, CTR, and industry benchmark figure, you MUST use your search capability to look up current rates before writing any number. Search for "[industry] average CPM 2025", "[channel] advertising benchmark [industry] 2025", "average CPC [channel] [industry]", and equivalent queries. Use ONLY search-verified rates, never use memorised training data for cost figures. If search returns a range, use the midpoint. Every benchmark in the benchmarks array must reference a figure you verified via search, not estimated from memory.
+11. Never show exact competitor ad counts in the plan. Use only High ad activity, Medium ad activity, Low ad activity, or Nil ad activity.`;
 }
 
 function buildUserPrompt(data, bInfo, months, totalBudgetLow, totalBudgetHigh, totalBudgetMid, keywordData, competitorIntelBlock) {
@@ -497,7 +734,7 @@ For each channel in the media mix, generate a mini creative brief with:
 ${data.creativeAssets ? 'The client has these creative assets available: ' + data.creativeAssets + '. Tailor format recommendations to what they actually have, do NOT recommend video-heavy campaigns if they have no video assets.' : 'The client has not specified available creative assets. Recommend achievable formats and flag where they may need to produce new assets.'}
 
 RULE 13, INDUSTRY BENCHMARK COMPARISON:
-Provide a benchmarks array comparing the plan's projected metrics against industry averages for ${data.industry}. Include 4-6 key metrics (CPC, CPM, CTR, CPA, conversion rate, ROAS as relevant). For each, show: the plan's target, the industry average, and whether the plan is above/below/at benchmark. ${data.pastPerformance ? 'The client reports past performance of: ' + data.pastPerformance + '. Use this to calibrate targets, if their historical CPA is higher than industry average, set realistic goals that improve on their past but do not assume best-in-class performance overnight.' : 'No past performance data provided, use industry midpoints as targets.'}
+Provide a benchmarks array comparing the plan's projected metrics against industry averages for ${data.industry}. Include 4-6 key metrics (CPC, CPM, CTR, CPA, conversion rate, ROAS as relevant). For each, show: the plan's target, the industry average, and whether the plan is above/below/at benchmark. ${data.pastPerformance ? 'The client reports past performance of: ' + data.pastPerformance + '. Treat this as a broad historical baseline, not as a final target. If RULE 20 provides a precise modeled target, use that exact target and explain whether beating the historical baseline is benchmark-supported.' : 'No past performance data provided, use industry midpoints as targets.'}
 
 RULE 14, GOAL-SPECIFIC KPI ALIGNMENT:
 The client's campaign goal is "${data.goal}" with primary KPI "${data.kpi}". Your entire plan must align to this goal:
@@ -1975,6 +2212,7 @@ Return ONLY valid JSON, no markdown, no code fences, no explanation text.`;
       ...data,
       industry: effectiveIndustry || formIndustry || 'General / Cross-Industry'
     };
+    const planningSignals = buildPlanningSignals(promptData, competitiveIntelResults, metaAdsResults);
     const systemInstruction = buildSystemPrompt(promptData);
     let userPrompt = buildUserPrompt(promptData, bInfo, months, totalBudgetLow, totalBudgetHigh, totalBudgetMid, keywordData, competitiveIntelBlock);
 
@@ -2008,6 +2246,14 @@ Return ONLY valid JSON, no markdown, no code fences, no explanation text.`;
     userPrompt += '\n\n' + benchmarkBlock;
     console.log('[RespondIQ] Benchmark anchors injected | industry:', industryForBenchmark || '(default fallback)',
       industryOverride && industryOverride.corrected ? '(CORRECTED from ' + formIndustry + ')' : '');
+
+    const planningSignalsBlock = buildPlanningSignalsPromptBlock(planningSignals);
+    if (planningSignalsBlock) {
+      userPrompt += '\n\n' + planningSignalsBlock;
+      console.log('[RespondIQ] Planning signals injected | calibration:',
+        planningSignals?.campaign_calibration?.modeled_target || 'none',
+        '| pressure:', planningSignals?.competitive_pressure?.label || 'none');
+    }
 
     // ── Inject industry correction notice into prompt (if corrected) ──
     if (industryOverride && industryOverride.corrected) {
@@ -2047,6 +2293,10 @@ Return ONLY valid JSON, no markdown, no code fences, no explanation text.`;
 
     if (metaAdsResults.length > 0) {
       result.meta_ads_intel = metaAdsResults;
+    }
+
+    if (planningSignals) {
+      result._planning_signals = planningSignals;
     }
 
     if (industryOverride && (industryOverride.corrected || industryWasAutoDetected)) {

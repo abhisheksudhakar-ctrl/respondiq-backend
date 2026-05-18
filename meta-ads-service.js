@@ -267,6 +267,15 @@ function activityLevel(adCount) {
   return 'None Detected';
 }
 
+function publicAdActivityLabel(value, adCount) {
+  const text = String(value || '').toLowerCase();
+  const n = Number(adCount || 0);
+  if (/very high|high/.test(text) || n > 100) return 'High ad activity';
+  if (/moderate|medium|active/.test(text) || n > 20) return 'Medium ad activity';
+  if (/low/.test(text) || n > 0) return 'Low ad activity';
+  return 'Nil ad activity';
+}
+
 function uniqueLower(values) {
   const out = [];
   const seen = new Set();
@@ -551,15 +560,16 @@ function buildMetaAdsPromptBlock(results) {
   for (const comp of found) {
     const platforms = (comp.platforms || []).length ? comp.platforms.join(', ') : 'not specified';
     const languages = (comp.languages || []).length ? comp.languages.join(', ') : 'not specified';
+    const publicActivity = publicAdActivityLabel(comp.activity_level, comp.ad_count);
     const regions = Array.isArray(comp.regions_active) && comp.regions_active.length
-      ? comp.regions_active.map(r => r.region + ' (' + r.ad_count + ' ads)').join(', ')
+      ? comp.regions_active.map(r => r.region + ' (' + publicAdActivityLabel(null, r.ad_count) + ')').join(', ')
       : comp.region;
 
     block += 'META VERIFIED: ' + comp.page_name + ' (query: ' + comp.query + ')\n';
     block += '- Meta page ID: ' + comp.page_id + '\n';
     block += '- Match confidence: ' + comp.match_confidence + (comp.match_confidence === 'medium' ? ' (Meta match: medium confidence; treat as directional)' : '') + '\n';
-    block += '- Active Meta ads in sample: ' + comp.ad_count_indicator + '\n';
-    block += '- Advertising activity level: ' + comp.activity_level + '\n';
+    block += '- Meta ad activity for planning: ' + publicActivity + '\n';
+    block += '- Exact Meta ad count: withheld from narrative; user-facing plans must show only High/Medium/Low/Nil activity tiers\n';
     block += '- Active on: ' + platforms + '\n';
     block += '- Language coverage: ' + languages + '\n';
     block += '- Regions active: ' + regions + '\n';
@@ -585,6 +595,7 @@ function buildMetaAdsPromptBlock(results) {
   block += '- Label all data points sourced from this block as "verified via Meta Ad Library"\n';
   block += '- Use Meta creative excerpts to inform Section 12 competitive SOV and creative strategy recommendations\n';
   block += '- Treat medium-confidence matches as directional and explicitly flag them as "Meta match: medium confidence" in any narrative\n';
+  block += '- Use only High/Medium/Low/Nil Meta activity wording in the plan; do NOT write a numeric Meta ad count anywhere in the plan\n';
   block += '- If Meta data is the only verified competitive source, set ai_data_confidence to "medium"; if Google Transparency and Meta data are both present, "high" is acceptable\n';
 
   return block;
