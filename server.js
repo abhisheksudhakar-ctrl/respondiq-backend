@@ -11,7 +11,7 @@ const { GoogleGenAI } = require('@google/genai');
 const { getKeywordIdeas, isKeywordServiceConfigured } = require('./keyword-service');
 const { getCompetitiveIntelligence, buildCompetitorPromptBlock } = require('./competitive-intel-service');
 const { getMetaAdsIntelligence, buildMetaAdsPromptBlock } = require('./meta-ads-service');
-const { BENCHMARKS, buildBenchmarkPromptBlock, refreshBenchmarksFromWeb, getBenchmarkMeta } = require('./benchmark-data');
+const { BENCHMARKS, BENCHMARK_SOURCES, resolveIndustryKey, buildBenchmarkPromptBlock, refreshBenchmarksFromWeb, getBenchmarkMeta } = require('./benchmark-data');
 
 const app = express();
 const PORT = process.env.PORT || 10000;
@@ -287,20 +287,23 @@ function activityScore(tier) {
 function benchmarkKeyForIndustry(industry) {
   const raw = String(industry || '').toLowerCase();
   if (!raw) return null;
+  const resolved = resolveIndustryKey(raw);
+  if (resolved && resolved !== 'default') return resolved;
   for (const [key, val] of Object.entries(BENCHMARKS)) {
     if (raw.includes(key.replace(/_/g, ' ')) || raw.includes(String(val.label || '').toLowerCase())) return key;
   }
   if (/e.?commerce|retail|dtc|shop/.test(raw)) return 'ecommerce';
   if (/legal|law/.test(raw)) return 'legal';
   if (/real estate|property/.test(raw)) return 'real_estate';
-  if (/health|medical|dental|clinic/.test(raw)) return 'healthcare';
+  if (/dental|dentist|orthodont/.test(raw)) return 'dental';
+  if (/health|medical|clinic/.test(raw)) return 'healthcare';
   if (/finance|financial|insurance|bank/.test(raw)) return 'finance';
   if (/b2b|saas|software|technology|tech/.test(raw)) return 'b2b_saas';
   if (/education|school|university/.test(raw)) return 'education';
   if (/home|local service|contractor/.test(raw)) return 'home_services';
   if (/travel|hotel|hospitality/.test(raw)) return 'travel';
   if (/automotive|auto|car/.test(raw)) return 'automotive';
-  if (/restaurant|food/.test(raw)) return 'restaurants';
+  if (/restaurant|food/.test(raw)) return 'restaurant';
   if (/fitness|wellness/.test(raw)) return 'fitness';
   if (/non.?profit|charity/.test(raw)) return 'nonprofit';
   return null;
@@ -780,6 +783,160 @@ app.get('/', (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════════
+// LOGO.DEV BRAND SEARCH: /api/brand-search
+// Server-side proxy keeps LOGO_DEV_SECRET_KEY private.
+// ══════════════════════════════════════════════════════════════
+const BRAND_SEARCH_CACHE = new Map();
+const BRAND_SEARCH_RATE_LIMIT = new Map();
+const BRAND_SEARCH_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const BRAND_SEARCH_WINDOW_MS = 60 * 1000;
+const BRAND_SEARCH_MAX_PER_WINDOW = 60;
+
+function getBrandSearchIp(req) {
+  return String(req.ip || req.headers['x-forwarded-for'] || req.socket?.remoteAddress || 'unknown')
+    .split(',')[0]
+    .trim();
+}
+
+function isBrandSearchRateLimited(ip) {
+  const now = Date.now();
+  const current = BRAND_SEARCH_RATE_LIMIT.get(ip);
+  if (!current || now - current.startedAt > BRAND_SEARCH_WINDOW_MS) {
+    BRAND_SEARCH_RATE_LIMIT.set(ip, { startedAt: now, count: 1 });
+    return false;
+  }
+  current.count += 1;
+  return current.count > BRAND_SEARCH_MAX_PER_WINDOW;
+}
+
+function cleanBrandQuery(value) {
+  return String(value || '').trim().replace(/\s+/g, ' ');
+}
+
+function toBrandDisplayName(domain) {
+  const base = String(domain || '')
+    .replace(/^www\./i, '')
+    .split('.')[0]
+    .replace(/[-_]+/g, ' ')
+    .trim();
+  if (!base) return domain || 'Brand';
+  return base.replace(/\b\w/g, ch => ch.toUpperCase());
+}
+
+function normalizeDirectBrandDomain(query) {
+  const raw = cleanBrandQuery(query);
+  if (!raw || /\s/.test(raw)) return null;
+  const candidate = /^https?:\/\//i.test(raw) ? raw : 'https://' + raw;
+  try {
+    const url = new URL(candidate);
+    let domain = String(url.hostname || '').toLowerCase().replace(/^www\./, '');
+    if (!domain || !domain.includes('.') || domain === 'localhost') return null;
+    domain = domain.replace(/:\d+$/, '');
+    return { name: toBrandDisplayName(domain), domain };
+  } catch {
+    return null;
+  }
+}
+
+function logoUrlForDomain(domain) {
+  const token = process.env.LOGO_DEV_PUBLISHABLE_KEY;
+  if (!token || !domain) return null;
+  return 'https://img.logo.dev/' + encodeURIComponent(domain) + '?token=' + encodeURIComponent(token);
+}
+
+function normalizeLogoDevResults(payload) {
+  const rawResults = Array.isArray(payload)
+    ? payload
+    : Array.isArray(payload?.results)
+      ? payload.results
+      : Array.isArray(payload?.data)
+        ? payload.data
+        : [];
+
+  const seen = new Set();
+  return rawResults.map(item => {
+    const domain = String(item.domain || item.website || item.url || item.company_domain || '').trim()
+      .replace(/^https?:\/\//i, '')
+      .replace(/^www\./i, '')
+      .split('/')[0]
+      .toLowerCase();
+    if (!domain || !domain.includes('.') || seen.has(domain)) return null;
+    seen.add(domain);
+    return {
+      name: String(item.name || item.brand || item.company_name || toBrandDisplayName(domain)).trim() || toBrandDisplayName(domain),
+      domain,
+      logoUrl: logoUrlForDomain(domain),
+      source: 'logo.dev'
+    };
+  }).filter(Boolean).slice(0, 5);
+}
+
+app.get('/api/brand-search', async (req, res) => {
+  const ip = getBrandSearchIp(req);
+  if (isBrandSearchRateLimited(ip)) {
+    console.warn('[RespondIQ] Logo.dev brand search rate limit hit:', ip);
+    return res.status(429).json({ error: 'Rate limit exceeded' });
+  }
+
+  const query = cleanBrandQuery(req.query.q);
+  if (query.length < 2 || query.length > 80) return res.json([]);
+
+  const direct = normalizeDirectBrandDomain(query);
+  if (direct) {
+    const result = [{
+      name: direct.name,
+      domain: direct.domain,
+      logoUrl: logoUrlForDomain(direct.domain),
+      source: 'direct_domain'
+    }];
+    console.log('[RespondIQ] Brand search direct domain:', direct.domain);
+    return res.json({ results: result });
+  }
+
+  const cacheKey = query.toLowerCase();
+  const cached = BRAND_SEARCH_CACHE.get(cacheKey);
+  if (cached && Date.now() - cached.cachedAt < BRAND_SEARCH_CACHE_TTL_MS) {
+    console.log('[RespondIQ] Logo.dev brand search cache hit:', query, '| results:', cached.results.length);
+    return res.json({ results: cached.results });
+  }
+
+  if (!process.env.LOGO_DEV_SECRET_KEY) {
+    console.warn('[RespondIQ] Logo.dev brand search fallback: logo_dev_not_configured');
+    return res.json({ results: [], fallback: true, reason: 'logo_dev_not_configured' });
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 5000);
+
+  try {
+    const logoRes = await fetch('https://api.logo.dev/search?q=' + encodeURIComponent(query), {
+      method: 'GET',
+      headers: {
+        Authorization: 'Bearer ' + process.env.LOGO_DEV_SECRET_KEY,
+        Accept: 'application/json'
+      },
+      signal: controller.signal
+    });
+    clearTimeout(timer);
+
+    if (!logoRes.ok) {
+      console.warn('[RespondIQ] Logo.dev brand search fallback: logo_dev_error | status:', logoRes.status);
+      return res.json({ results: [], fallback: true, reason: 'logo_dev_error' });
+    }
+
+    const payload = await logoRes.json();
+    const results = normalizeLogoDevResults(payload);
+    BRAND_SEARCH_CACHE.set(cacheKey, { cachedAt: Date.now(), results });
+    console.log('[RespondIQ] Logo.dev brand search:', query, '| results:', results.length);
+    return res.json({ results });
+  } catch (err) {
+    clearTimeout(timer);
+    console.warn('[RespondIQ] Logo.dev brand search fallback: logo_dev_error |', err.message);
+    return res.json({ results: [], fallback: true, reason: 'logo_dev_error' });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════
 // DEDICATED PDF EXPORT: /api/export-pdf
 // Server-rendered, page-based PDF template. This avoids browser print
 // pagination drift from window.print(), chart timing, and user margin settings.
@@ -794,7 +951,9 @@ function textValue(value, fallback = '-') {
     .replace(/&amp;/g, '&')
     .replace(/&quot;/g, '"')
     .replace(/&#39;/g, "'")
+    .replace(/(\$[\d,]+(?:\.\d+)?)(?=(?![KMB]\b)[A-Za-z])/gi, '$1 ')
     .replace(/(\$[\d,]+(?:\.\d+)?)\s*totalinvestment/gi, '$1 total investment')
+    .replace(/(\$[\d,]+(?:\.\d+)?)\s*total\s+investment/gi, '$1 total investment')
     .replace(/\btotalinvestment\b/gi, 'total investment')
     .replace(/[\u{1F300}-\u{1FAFF}\u2600-\u27BF]/gu, '')
     .replace(/\s+/g, ' ')
@@ -1404,7 +1563,14 @@ function createRespondIqPdfBuffer(data, plan) {
       asArray(p.benchmarks).map(b => [b.metric, b.plan_target, b.industry_avg, b.vs_benchmark]),
       { widths: [135, 120, 150, 98], fontSize: 7.8, headerFill: '#e9f4ff', headerColor: palette.blue }
     );
-    paragraph('Benchmarks based on 2025-2026 industry aggregates. Actual performance varies by creative quality, landing page experience, and competitive landscape.', { size: 8, color: palette.muted });
+    let attributionText = '';
+    const planSources = p._benchmark_sources || [];
+    if (Array.isArray(planSources) && planSources.length > 0) {
+      const premium = planSources.filter(s => s.tier === 'premium').slice(0, 3);
+      const sourcesToUse = premium.length > 0 ? premium : planSources.slice(0, 3);
+      attributionText = ' via ' + sourcesToUse.map(s => s.short_name).join(', ');
+    }
+    paragraph('Benchmarks based on 2025-2026 industry aggregates' + attributionText + '. Actual performance varies by creative quality, landing page experience, and competitive landscape.', { size: 8, color: palette.muted });
   }
 
   if (asArray(p._keywordResults).length) {
@@ -1587,9 +1753,10 @@ async function createRespondIqPptxBuffer(data, plan) {
   function addPanel(slide, x, y, w, h, title, body, accent = palette.navy, opts = {}) {
     const bodyText = clean(body, opts.max || 460, '');
     const baseBodySize = opts.bodySize || 10.4;
-    const bodySize = bodyText.length > 520 ? Math.max(7.2, baseBodySize - 1.5) :
-                     bodyText.length > 360 ? Math.max(7.6, baseBodySize - 1.0) :
-                     bodyText.length > 220 ? Math.max(8.0, baseBodySize - 0.4) :
+    const minBodySize = opts.minBodySize || 6.3;
+    const bodySize = bodyText.length > 520 ? Math.max(minBodySize, baseBodySize - 1.5) :
+                     bodyText.length > 360 ? Math.max(minBodySize, baseBodySize - 1.0) :
+                     bodyText.length > 220 ? Math.max(minBodySize, baseBodySize - 0.4) :
                      baseBodySize;
     addRect(slide, x, y, w, h, opts.fill || palette.light, opts.line || palette.border);
     addRect(slide, x, y, 0.06, h, accent);
@@ -1625,7 +1792,7 @@ async function createRespondIqPptxBuffer(data, plan) {
       valign: 'top'
     };
     if (opts.fill) options.fill = { color: opts.fill };
-    if (opts.fontSize) options.fontSize = Math.max(opts.fontSize, opts.minFontSize || 7.4);
+    if (opts.fontSize) options.fontSize = Math.max(opts.fontSize, opts.minFontSize || 6.0);
     return {
       text: clean(text, opts.max || 120, ''),
       options
@@ -1633,8 +1800,8 @@ async function createRespondIqPptxBuffer(data, plan) {
   }
 
   function addTable(slide, columns, rows, x, y, w, h, colW, accent = palette.navy, opts = {}) {
-    const tableFontSize = Math.max(opts.fontSize || 7.8, opts.minFontSize || 7.4);
-    const headerFontSize = Math.max(opts.headerSize || 7.8, 7.4);
+    const tableFontSize = Math.max(opts.fontSize || 7.8, opts.minFontSize || 6.0);
+    const headerFontSize = Math.max(opts.headerSize || 7.8, opts.headerMinFontSize || 6.2);
     const header = columns.map(col => tableCell(col, { bold: true, color: accent, fill: opts.headerFill || palette.gray, max: opts.headerMax || 38, fontSize: headerFontSize, margin: opts.margin }));
     const body = rows.map(row => row.map(cell => tableCell(cell, { max: opts.cellMax || 110, fontSize: tableFontSize, margin: opts.margin })));
     slide.addTable([header, ...body], {
@@ -1707,9 +1874,9 @@ async function createRespondIqPptxBuffer(data, plan) {
 
   function drawStrategy() {
     const slide = newSlide('Section 01', 'Executive Strategy', palette.navy);
-    addPanel(slide, 0.62, 1.68, 5.85, 4.85, 'Executive Summary', p.executive_summary, palette.navy, { bodySize: 11, max: 760 });
-    addPanel(slide, 6.78, 1.68, 5.94, 2.15, 'Media Strategy', p.media_strategy, palette.blue, { bodySize: 9.5, max: 430 });
-    addPanel(slide, 6.78, 4.08, 5.94, 2.45, 'Recommended Next Steps', listText(p.recommendations, 5, 115), palette.orange, { bodySize: 8.6, max: 620 });
+    addPanel(slide, 0.62, 1.68, 5.85, 4.95, 'Executive Summary', p.executive_summary, palette.navy, { bodySize: 10.3, max: 720, minBodySize: 6.6 });
+    addPanel(slide, 6.78, 1.68, 5.94, 2.72, 'Media Strategy', p.media_strategy, palette.blue, { bodySize: 8.4, max: 390, minBodySize: 6.2 });
+    addPanel(slide, 6.78, 4.66, 5.94, 1.97, 'Recommended Next Steps', listText(p.recommendations, 4, 92), palette.orange, { bodySize: 7.3, max: 390, minBodySize: 6.0 });
   }
 
   function drawAudienceObjectives() {
@@ -1725,14 +1892,11 @@ async function createRespondIqPptxBuffer(data, plan) {
   function drawChannels() {
     const channels = asArray(p.channels);
     if (!channels.length) return;
-    chunk(channels, 4).forEach((part, pageIdx) => {
+    chunk(channels, 2).forEach((part, pageIdx) => {
       const slide = newSlide('Section 06', pageIdx ? 'Media Channel Mix (cont.)' : 'Media Channel Mix', palette.orange);
       part.forEach((ch, idx) => {
-        const col = idx % 2;
-        const row = Math.floor(idx / 2);
-        const x = 0.62 + col * 6.18;
-        const y = 1.68 + row * 2.32;
-        addPanel(slide, x, y, 5.85, 2.05, clean(ch.name, 44) + ' - ' + clean(ch.budget_pct, 12), clean(ch.rationale, 180) + '\n' + listText(ch.tactics, 3, 82), palette.orange, { bodySize: 7.7, max: 520 });
+        const y = 1.68 + idx * 2.48;
+        addPanel(slide, 0.62, y, 12.1, 2.22, clean(ch.name, 44) + ' - ' + clean(ch.budget_pct, 12), clean(ch.rationale, 220) + '\n' + listText(ch.tactics, 3, 120), palette.orange, { bodySize: 8.0, max: 620, minBodySize: 6.2 });
       });
     });
   }
@@ -1780,32 +1944,29 @@ async function createRespondIqPptxBuffer(data, plan) {
     const slide = newSlide('Sections 10 & 14', 'Risk and Conversion Readiness', palette.amber);
     const riskRows = risks.slice(0, 5).map(r => [r.risk, r.impact, r.probability, r.mitigation]);
     if (riskRows.length) {
-      addTable(slide, ['Risk', 'Impact', 'Prob.', 'Mitigation'], riskRows, 0.62, 1.72, 12.1, 2.35, [3.0, 1.15, 1.15, 6.8], palette.amber, { fontSize: 6.3, cellMax: 105, headerFill: 'FFF7E8' });
+      addTable(slide, ['Risk', 'Impact', 'Prob.', 'Mitigation'], riskRows, 0.62, 1.72, 12.1, 2.9, [3.0, 1.15, 1.15, 6.8], palette.amber, { fontSize: 6.2, cellMax: 100, headerFill: 'FFF7E8', margin: 0.035 });
     }
     if (p.cro_audit) {
-      addPanel(slide, 0.62, 4.48, 2.75, 1.48, 'Landing Page Score', clean(p.cro_audit.landing_page_score, 20), palette.amber, { bodySize: 18, max: 20 });
-      addPanel(slide, 3.62, 4.48, 4.35, 1.48, 'Missing Elements', listText(p.cro_audit.missing_elements, 3, 86), palette.amber, { bodySize: 6.8, max: 285 });
-      addPanel(slide, 8.22, 4.48, 4.5, 1.48, 'CRO Recommendations', listText(p.cro_audit.recommendations, 3, 86), palette.teal, { bodySize: 6.8, max: 285 });
+      addPanel(slide, 0.62, 4.9, 2.75, 1.52, 'Landing Page Score', clean(p.cro_audit.landing_page_score, 20), palette.amber, { bodySize: 18, max: 20 });
+      addPanel(slide, 3.62, 4.9, 4.35, 1.52, 'Missing Elements', listText(p.cro_audit.missing_elements, 3, 78), palette.amber, { bodySize: 6.4, max: 260, minBodySize: 5.8 });
+      addPanel(slide, 8.22, 4.9, 4.5, 1.52, 'CRO Recommendations', listText(p.cro_audit.recommendations, 3, 78), palette.teal, { bodySize: 6.4, max: 260, minBodySize: 5.8 });
     }
   }
 
   function drawCreative() {
     const briefs = asArray(p.creative_briefs);
     if (!briefs.length) return;
-    chunk(briefs, 4).forEach((part, pageIdx) => {
+    chunk(briefs, 2).forEach((part, pageIdx) => {
       const slide = newSlide('Section 15', pageIdx ? 'Creative Briefs (cont.)' : 'Creative Briefs', palette.amber);
       part.forEach((b, idx) => {
-        const col = idx % 2;
-        const row = Math.floor(idx / 2);
-        const x = 0.62 + col * 6.18;
-        const y = 1.68 + row * 2.32;
+        const y = 1.68 + idx * 2.48;
         const headlines = asArray(b.headline_direction).length ? asArray(b.headline_direction).join('; ') : textValue(b.headline_direction, '');
-        addPanel(slide, x, y, 5.85, 2.05, clean(b.channel, 44), [
+        addPanel(slide, 0.62, y, 12.1, 2.22, clean(b.channel, 44), [
           'Format: ' + clean(b.format, 80),
           'Headline: ' + clean(headlines, 120),
           'CTA: ' + clean(b.cta, 60),
-          'Notes: ' + clean(b.creative_notes, 120)
-        ].join('\n'), palette.amber, { bodySize: 7.25, max: 460 });
+          'Notes: ' + clean(b.creative_notes, 130)
+        ].join('\n'), palette.amber, { bodySize: 7.8, max: 560, minBodySize: 6.1 });
       });
     });
   }
@@ -1833,9 +1994,9 @@ async function createRespondIqPptxBuffer(data, plan) {
 
   function drawRecommendations() {
     const slide = newSlide('Section 13', 'Recommendations and Next Steps', palette.navy);
-    addPanel(slide, 0.62, 1.72, 6.0, 4.45, 'Priority Actions', listText(p.recommendations, 7, 140), palette.navy, { bodySize: 9.1, max: 900 });
-    addPanel(slide, 6.9, 1.72, 5.82, 2.0, 'Campaign Governance', listText(p.monitoring_tools && asArray(p.monitoring_tools).map(m => [m.tool, m.frequency, m.trigger].filter(Boolean).join(' - ')), 4, 120), palette.blue, { bodySize: 8.1, max: 560 });
-    addPanel(slide, 6.9, 4.02, 5.82, 2.15, 'Important Notice', 'AI-generated media plans should be treated as strategic starting points. Validate budget allocations, rates, audience estimates, and competitive figures in platform tools before committing spend.', palette.orange, { bodySize: 8.4, max: 420 });
+    addPanel(slide, 0.62, 1.72, 6.0, 4.75, 'Priority Actions', listText(p.recommendations, 6, 125), palette.navy, { bodySize: 8.4, max: 760, minBodySize: 6.2 });
+    addPanel(slide, 6.9, 1.72, 5.82, 2.25, 'Campaign Governance', listText(p.monitoring_tools && asArray(p.monitoring_tools).map(m => [m.tool, m.frequency, m.trigger].filter(Boolean).join(' - ')), 4, 105), palette.blue, { bodySize: 7.4, max: 460, minBodySize: 6.0 });
+    addPanel(slide, 6.9, 4.25, 5.82, 2.22, 'Important Notice', 'AI-generated media plans should be treated as strategic starting points. Validate budget allocations, rates, audience estimates, and competitive figures in platform tools before committing spend.', palette.orange, { bodySize: 7.6, max: 390, minBodySize: 6.0 });
   }
 
   function drawClosing() {
@@ -2362,6 +2523,34 @@ Return ONLY valid JSON, no markdown, no code fences, no explanation text.`;
         reason: industryOverride.reason,
         auto_detected: industryWasAutoDetected,
       };
+    }
+
+    // ── Surface benchmark sources used for this plan ──
+    try {
+      const benchmarkKey = effectiveIndustryKey || resolveIndustryKey(effectiveIndustry || data.industry || '');
+      const industryEntry = BENCHMARKS[benchmarkKey];
+      if (industryEntry && Array.isArray(industryEntry._sources) && industryEntry._sources.length > 0) {
+        result._benchmark_sources = industryEntry._sources
+          .map(sid => {
+            const s = BENCHMARK_SOURCES[sid];
+            if (!s) return null;
+            return {
+              id: sid,
+              short_name: s.short_name,
+              publisher: s.publisher,
+              label: s.label,
+              url: s.url,
+              period: s.period,
+              tier: s.tier,
+              confidence: s.confidence
+            };
+          })
+          .filter(Boolean);
+        result._benchmark_industry_key = benchmarkKey;
+        result._benchmark_industry_label = industryEntry.label;
+      }
+    } catch (e) {
+      console.warn('[RespondIQ] Could not attach benchmark sources:', e.message);
     }
 
     res.json(result);
