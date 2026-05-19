@@ -405,15 +405,15 @@ function buildCampaignCalibrationSignal(data, pressure) {
       beatSupported = !!adjustedBenchmark && adjustedBenchmark <= historical.high * 0.9;
       if (beatSupported) {
         target = roundMoney(Math.min(adjustedBenchmark * 0.98, historical.high * 0.92));
-        logic = `Benchmarks support beating the reported business-level CPA bucket; use a precise modeled launch target of $${target}.`;
+        logic = `Reported performance is treated as a blended business-level baseline; paid-media benchmarks support a precise modeled launch target of $${target}.`;
       } else {
         target = roundMoney(adjustedBenchmark || historical.high);
-        logic = `Do not copy "${historical.bucket}" as the target. Treat it as a blended historical baseline; paid-media benchmarks support a precise modeled launch target of $${target}.`;
+        logic = `Reported performance is treated as a blended historical baseline; paid-media benchmarks support a precise modeled launch target of $${target}.`;
       }
     } else if (historical.low) {
       target = roundMoney(adjustedBenchmark || historical.low * 0.85);
       beatSupported = !!adjustedBenchmark && adjustedBenchmark < historical.low;
-      logic = `Historical CPA is above $${historical.low}; use a precise modeled launch target of $${target} and frame it as an improvement path.`;
+      logic = `Historical CPA is used as a blended baseline; the plan models a launch target of $${target} and frames it as an improvement path.`;
     }
 
     return {
@@ -449,7 +449,7 @@ function buildCampaignCalibrationSignal(data, pressure) {
       beat_supported: beatSupported,
       logic: beatSupported
         ? `Benchmarks support a precise ROAS target above the reported range: ${target.toFixed(1)}:1.`
-        : `Use ${target.toFixed(1)}:1 as the precise ROAS target; do not copy the reported range as the plan target.`
+        : `The reported ROAS range is treated as historical context; the plan uses ${target.toFixed(1)}:1 as the modeled target.`
     };
   }
 
@@ -457,7 +457,7 @@ function buildCampaignCalibrationSignal(data, pressure) {
     metric: historical.metric,
     reported_label: historical.label,
     reported_bucket: historical.bucket,
-    logic: 'Use this as context only; do not repeat it as a performance target without modeling a precise KPI.'
+    logic: 'Reported performance is used as historical context and calibrated against benchmarks before setting plan targets.'
   };
 }
 
@@ -486,7 +486,7 @@ function buildPlanningSignalsPromptBlock(signals) {
   if (calibration) {
     block += `- Reported historical baseline: ${calibration.reported_label}. Treat this as broad business-level context unless the user says it is platform-specific.\n`;
     if (calibration.modeled_target) {
-      block += `- Required precise modeled target: ${calibration.modeled_target} ${calibration.metric}. Do NOT copy the bucket "${calibration.reported_bucket}" as the target.\n`;
+      block += `- Required precise modeled target: ${calibration.modeled_target} ${calibration.metric}. Use this client-facing target instead of repeating the reported bucket "${calibration.reported_bucket}".\n`;
       block += `- Beat historical only when benchmark-supported: ${calibration.beat_supported ? 'yes' : 'no'}. ${calibration.logic}\n`;
       block += '- Include a visible "Reported Historical Baseline" note in objectives or recommendations explaining how the plan target was calibrated.\n';
     }
@@ -494,9 +494,9 @@ function buildPlanningSignalsPromptBlock(signals) {
   if (pressure) {
     block += `- Competitive pressure: ${pressure.label}. Verified source matches: ${pressure.verified_sources}. CPC/CPM sensitivity adjustment: +${pressure.rate_adjustment_pct}%.\n`;
     block += '- Show this as a visible planning signal in the plan. Use it to explain rate pressure, share-of-voice risk, conquesting difficulty, and monitoring needs.\n';
-    block += '- Do NOT write exact competitor ad counts in the plan. Use only: High ad activity, Medium ad activity, Low ad activity, or Nil ad activity.\n';
+    block += '- Client-facing competitor activity should use only these tiers: High ad activity, Medium ad activity, Low ad activity, or Nil ad activity.\n';
   }
-  block += 'Output precise KPI values like "$18 CPA" or "$26 CPA"; never output vague copied buckets like "under $20 CPA" as the plan target.\n';
+  block += 'Client-facing KPI values should be precise, such as "$18 CPA" or "$26 CPA", rather than broad historical buckets such as "under $20 CPA".\n';
   return block;
 }
 
@@ -791,6 +791,11 @@ function textValue(value, fallback = '-') {
     .replace(/[\u201C\u201D]/g, '"')
     .replace(/[\u2013\u2014]/g, '-')
     .replace(/\u2026/g, '...')
+    .replace(/&amp;/g, '&')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/(\$[\d,]+(?:\.\d+)?)\s*totalinvestment/gi, '$1 total investment')
+    .replace(/\btotalinvestment\b/gi, 'total investment')
     .replace(/[\u{1F300}-\u{1FAFF}\u2600-\u27BF]/gu, '')
     .replace(/\s+/g, ' ')
     .trim();
@@ -840,6 +845,48 @@ function inferFlightColumns(duration) {
   return { headers: ['Wks 1-3', 'Wks 4-6', 'Wks 7-9', 'Wks 10-12'], keys: ['wk1_3', 'wk4_6', 'wk7_9', 'wk10_12'] };
 }
 
+function redactKnownPersonalText(value, personal = {}) {
+  if (typeof value !== 'string') return value;
+  let text = value;
+  [personal.userName, personal.userEmail, personal.userPhone]
+    .filter(v => typeof v === 'string' && v.trim().length >= 3)
+    .forEach(raw => {
+      const escaped = raw.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      text = text.replace(new RegExp(escaped, 'gi'), '[redacted personal info]');
+    });
+  return text
+    .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, '[redacted email]')
+    .replace(/(?:\+\d{1,3}[\s.-]?)?(?:\(\d{3}\)|\d{3})[\s.-]\d{3}[\s.-]\d{4}/g, '[redacted phone]');
+}
+
+function redactKnownPersonalData(value, personal = {}) {
+  if (Array.isArray(value)) return value.map(item => redactKnownPersonalData(item, personal));
+  if (value && typeof value === 'object') {
+    const out = {};
+    Object.keys(value).forEach(key => { out[key] = redactKnownPersonalData(value[key], personal); });
+    return out;
+  }
+  return redactKnownPersonalText(value, personal);
+}
+
+function stripPersonalFieldsForAI(raw = {}) {
+  const personal = {
+    userName: raw.userName,
+    userEmail: raw.userEmail,
+    userPhone: raw.userPhone
+  };
+  const {
+    userName,
+    userEmail,
+    userPhone,
+    marketingConsent,
+    privacyConsent,
+    consentTimestamp,
+    ...planningData
+  } = raw || {};
+  return redactKnownPersonalData(planningData, personal);
+}
+
 function createRespondIqPdfBuffer(data, plan) {
   let PDFDocument;
   try {
@@ -861,7 +908,7 @@ function createRespondIqPdfBuffer(data, plan) {
     margins: { top: 46, left: 46, right: 46, bottom: 18 },
     info: {
       Title: campaign + ' - RespondIQ Media Plan',
-      Author: 'RespondIQ by Responsive MTS',
+      Author: 'RespondIQ\nby\nResponsive MTS',
       Subject: 'AI-generated media plan',
     }
   });
@@ -925,11 +972,11 @@ function createRespondIqPdfBuffer(data, plan) {
   function sectionHeader(no, title, color, continued) {
     doc.moveTo(state.left, state.y).lineTo(state.left + 64, state.y).lineWidth(2).strokeColor(color).stroke();
     state.y += 12;
-    doc.font('Helvetica-Bold').fontSize(8).fillColor(color).text((continued ? no + ' CONT.' : no).toUpperCase(), state.left, state.y);
+    doc.font('Helvetica-Bold').fontSize(8.5).fillColor(color).text((continued ? no + ' CONT.' : no).toUpperCase(), state.left, state.y);
     state.y += 13;
     doc.circle(state.left + 6, state.y + 7, 4).fill(color);
-    doc.font('Helvetica-Bold').fontSize(18).fillColor(palette.ink).text(title, state.left + 18, state.y, { width: state.width - 18 });
-    state.y += 32;
+    doc.font('Helvetica-Bold').fontSize(21).fillColor(palette.ink).text(title, state.left + 18, state.y, { width: state.width - 18 });
+    state.y += 36;
   }
 
   function startSection(no, title, color = palette.navy) {
@@ -958,7 +1005,7 @@ function createRespondIqPdfBuffer(data, plan) {
   }
 
   function paragraph(text, options = {}) {
-    const size = options.size || 9;
+    const size = options.size || 10.5;
     const width = options.width || state.width;
     const lineGap = options.lineGap ?? 3;
     const x = options.x || state.left;
@@ -973,8 +1020,8 @@ function createRespondIqPdfBuffer(data, plan) {
 
   function subsection(title, color = palette.ink) {
     ensureSpace(28);
-    doc.font('Helvetica-Bold').fontSize(11).fillColor(color).text(title, state.left, state.y);
-    state.y += 19;
+    doc.font('Helvetica-Bold').fontSize(12.5).fillColor(color).text(title, state.left, state.y);
+    state.y += 21;
   }
 
   function card(x, y, w, h, fill = palette.light, stroke = palette.border) {
@@ -1003,7 +1050,7 @@ function createRespondIqPdfBuffer(data, plan) {
     rows.forEach(row => {
       const heights = row.map(item => {
         const value = textValue(item.value);
-        doc.font('Helvetica').fontSize(9);
+        doc.font('Helvetica').fontSize(10);
         const valueH = doc.heightOfString(value, { width: w - 22, lineGap: 2 });
         return Math.max(62, valueH + 42);
       });
@@ -1017,9 +1064,9 @@ function createRespondIqPdfBuffer(data, plan) {
         const x = state.left + idx * (w + gap);
         const value = textValue(item.value);
         card(x, y, w, rowH);
-        doc.font('Helvetica-Bold').fontSize(7).fillColor(palette.muted)
+        doc.font('Helvetica-Bold').fontSize(8).fillColor(palette.muted)
           .text(textValue(item.label).toUpperCase(), x + 11, y + 11, { width: w - 22, lineBreak: false, ellipsis: true });
-        doc.font('Helvetica').fontSize(9).fillColor(palette.ink)
+        doc.font('Helvetica').fontSize(10).fillColor(palette.ink)
           .text(value, x + 11, y + 29, { width: w - 22, lineGap: 2, height: rowH - 39 });
       });
       y += rowH + gap;
@@ -1030,12 +1077,12 @@ function createRespondIqPdfBuffer(data, plan) {
   function bulletList(items, color = palette.blue) {
     asArray(items).forEach(item => {
       const value = typeof item === 'string' ? item : JSON.stringify(item);
-      doc.font('Helvetica').fontSize(9);
+      doc.font('Helvetica').fontSize(10);
       const h = Math.max(30, doc.heightOfString(textValue(value), { width: state.width - 30, lineGap: 2 }) + 18);
       ensureSpace(h + 5);
       card(state.left, state.y, state.width, h, '#ffffff', palette.border);
       doc.rect(state.left, state.y, 3, h).fill(color);
-      doc.font('Helvetica').fontSize(9).fillColor(palette.ink)
+      doc.font('Helvetica').fontSize(10).fillColor(palette.ink)
         .text(textValue(value), state.left + 16, state.y + 9, { width: state.width - 30, lineGap: 2, height: h - 16 });
       state.y += h + 6;
     });
@@ -1045,8 +1092,8 @@ function createRespondIqPdfBuffer(data, plan) {
   function drawTable(columns, rows, options = {}) {
     const widths = options.widths || columns.map(() => state.width / columns.length);
     const headerFill = options.headerFill || palette.gray;
-    const fontSize = options.fontSize || 8;
-    const headerHeight = options.headerHeight || 24;
+    const fontSize = Math.max(options.fontSize || 8.8, 7.8);
+    const headerHeight = options.headerHeight || 26;
     const section = { no: state.currentNo, title: state.currentTitle, color: state.currentColor };
 
     function drawHeader() {
@@ -1054,7 +1101,7 @@ function createRespondIqPdfBuffer(data, plan) {
       let x = state.left;
       doc.rect(state.left, state.y, state.width, headerHeight).fill(headerFill);
       columns.forEach((col, i) => {
-        doc.font('Helvetica-Bold').fontSize(7).fillColor(options.headerColor || palette.navy)
+        doc.font('Helvetica-Bold').fontSize(Math.max(options.headerFontSize || 8, 7.5)).fillColor(options.headerColor || palette.navy)
           .text(textValue(col).toUpperCase(), x + 7, state.y + 8, { width: widths[i] - 10 });
         x += widths[i];
       });
@@ -1065,7 +1112,7 @@ function createRespondIqPdfBuffer(data, plan) {
     rows.forEach((row, r) => {
       doc.font('Helvetica').fontSize(fontSize);
       const heights = row.map((cell, i) => doc.heightOfString(textValue(cell), { width: widths[i] - 12, lineGap: 1 }) + 14);
-      const rowH = Math.max(options.minRowHeight || 26, ...heights);
+      const rowH = Math.max(options.minRowHeight || 30, ...heights);
       if (state.y + rowH > state.bottom) {
         state.currentNo = section.no;
         state.currentTitle = section.title;
@@ -1091,12 +1138,12 @@ function createRespondIqPdfBuffer(data, plan) {
     items.forEach((it, i) => {
       const label = textValue(it[labelKey]);
       const pct = parsePct(it[valueKey]);
-      ensureSpace(23);
-      doc.font('Helvetica').fontSize(8).fillColor(palette.ink).text(label, state.left, state.y + 2, { width: 145, ellipsis: true });
+      ensureSpace(25);
+      doc.font('Helvetica').fontSize(9).fillColor(palette.ink).text(label, state.left, state.y + 2, { width: 145, ellipsis: true });
       doc.roundedRect(state.left + 150, state.y, 250, 12, 4).fill('#eef2f7');
       doc.roundedRect(state.left + 150, state.y, Math.max(4, 250 * (pct / max)), 12, 4).fill(options.color || palette.blue);
-      doc.font('Helvetica').fontSize(8).fillColor(palette.muted).text((pct || 0).toFixed(0) + '%', state.left + 412, state.y + 1, { width: 50, align: 'right' });
-      state.y += 22;
+      doc.font('Helvetica').fontSize(9).fillColor(palette.muted).text((pct || 0).toFixed(0) + '%', state.left + 412, state.y + 1, { width: 50, align: 'right' });
+      state.y += 24;
       if (i === items.length - 1) state.y += 6;
     });
   }
@@ -1108,8 +1155,9 @@ function createRespondIqPdfBuffer(data, plan) {
     const midY = 220;
     doc.rect(0, 0, doc.page.width, 170).fill(palette.navy);
     doc.rect(0, 170, doc.page.width, 8).fill(palette.orange);
-    doc.font('Helvetica-Bold').fontSize(19).fillColor('#ffffff').text('RESPONDIQ', state.left, 72, { align: 'center', width: state.width });
-    doc.font('Helvetica').fontSize(10).fillColor('#cbd5e1').text('by Responsive Media Tech Services', state.left, 100, { align: 'center', width: state.width });
+    doc.font('Helvetica-Bold').fontSize(19).fillColor('#ffffff').text('RESPONDIQ', state.left, 62, { align: 'center', width: state.width });
+    doc.font('Helvetica').fontSize(9).fillColor('#cbd5e1').text('by', state.left, 93, { align: 'center', width: state.width });
+    doc.font('Helvetica-Bold').fontSize(13).fillColor('#ffffff').text('Responsive MTS', state.left, 110, { align: 'center', width: state.width });
     doc.font('Helvetica-Bold').fontSize(42).fillColor(palette.ink).text('Thank You', state.left, midY, { align: 'center', width: state.width });
     doc.font('Helvetica').fontSize(12).fillColor(palette.muted).text('Prepared for ' + brand, state.left, midY + 58, { align: 'center', width: state.width });
     card(state.left + 72, midY + 105, state.width - 144, 102, '#fff7ed', '#ffd7c2');
@@ -1125,11 +1173,12 @@ function createRespondIqPdfBuffer(data, plan) {
     doc.rect(0, 0, doc.page.width, 268).fill(palette.navy);
     doc.rect(0, 268, doc.page.width, 9).fill(palette.orange);
     doc.rect(state.left, 64, 66, 4).fill(palette.orange);
-    doc.font('Helvetica-Bold').fontSize(20).fillColor('#ffffff').text('RESPONDIQ', state.left, 82, { width: state.width });
-    doc.font('Helvetica').fontSize(9).fillColor('#cbd5e1').text('by Responsive Media Tech Services', state.left, 111, { width: state.width });
+    doc.font('Helvetica-Bold').fontSize(20).fillColor('#ffffff').text('RESPONDIQ', state.left, 78, { width: state.width });
+    doc.font('Helvetica').fontSize(9).fillColor('#cbd5e1').text('by', state.left, 106, { width: state.width });
+    doc.font('Helvetica-Bold').fontSize(13).fillColor('#ffffff').text('Responsive MTS', state.left, 121, { width: state.width });
     const coverTitleSize = campaign.length > 46 ? 29 : campaign.length > 30 ? 34 : 38;
     doc.font('Helvetica-Bold').fontSize(coverTitleSize).fillColor('#ffffff').text(campaign, state.left, 154, { width: state.width - 38, height: 66, lineGap: 2, ellipsis: true });
-    doc.font('Helvetica').fontSize(13).fillColor('#e2e8f0').text('AI-powered media strategy and launch plan', state.left, 229, { width: state.width - 40 });
+    doc.font('Helvetica').fontSize(13).fillColor('#e2e8f0').text('Client-ready media strategy generated by the RespondIQ AI Engine', state.left, 229, { width: state.width - 40 });
 
     card(state.left, 312, state.width, 156, '#ffffff', palette.border);
     doc.rect(state.left, 312, 7, 156).fill(palette.orange);
@@ -1429,8 +1478,8 @@ async function createRespondIqPptxBuffer(data, plan) {
 
   const pptx = new PptxGenJS();
   pptx.layout = 'LAYOUT_WIDE';
-  pptx.author = 'RespondIQ by Responsive MTS';
-  pptx.company = 'Responsive Media Tech Services';
+  pptx.author = 'RespondIQ\nby\nResponsive MTS';
+  pptx.company = 'Responsive MTS';
   pptx.subject = 'AI-generated media plan';
   pptx.title = campaign + ' - RespondIQ Media Plan';
   pptx.lang = 'en-US';
@@ -1494,7 +1543,7 @@ async function createRespondIqPptxBuffer(data, plan) {
     slide.addText(clean(text, opts.max || 500, opts.fallback || ''), {
       x, y, w, h,
       fontFace: opts.fontFace || 'Aptos',
-      fontSize: opts.fontSize || 11,
+      fontSize: opts.fontSize || 12,
       color: opts.color || palette.ink,
       bold: !!opts.bold,
       italic: !!opts.italic,
@@ -1537,14 +1586,14 @@ async function createRespondIqPptxBuffer(data, plan) {
 
   function addPanel(slide, x, y, w, h, title, body, accent = palette.navy, opts = {}) {
     const bodyText = clean(body, opts.max || 460, '');
-    const baseBodySize = opts.bodySize || 9.5;
-    const bodySize = bodyText.length > 520 ? Math.max(6.2, baseBodySize - 1.6) :
-                     bodyText.length > 360 ? Math.max(6.6, baseBodySize - 1.1) :
-                     bodyText.length > 220 ? Math.max(7.0, baseBodySize - 0.5) :
+    const baseBodySize = opts.bodySize || 10.4;
+    const bodySize = bodyText.length > 520 ? Math.max(7.2, baseBodySize - 1.5) :
+                     bodyText.length > 360 ? Math.max(7.6, baseBodySize - 1.0) :
+                     bodyText.length > 220 ? Math.max(8.0, baseBodySize - 0.4) :
                      baseBodySize;
     addRect(slide, x, y, w, h, opts.fill || palette.light, opts.line || palette.border);
     addRect(slide, x, y, 0.06, h, accent);
-    addText(slide, title, x + 0.18, y + 0.18, w - 0.36, 0.22, { fontSize: opts.titleSize || 8, color: accent, bold: true, max: 70 });
+    addText(slide, title, x + 0.18, y + 0.18, w - 0.36, 0.24, { fontSize: opts.titleSize || 8.8, color: accent, bold: true, max: 70 });
     addText(slide, bodyText, x + 0.18, y + 0.48, w - 0.36, h - 0.62, { fontSize: bodySize, color: opts.bodyColor || palette.ink, max: opts.max || 460, fit: 'shrink' });
   }
 
@@ -1561,10 +1610,10 @@ async function createRespondIqPptxBuffer(data, plan) {
       const yy = y + idx * rowH;
       const pct = parsePct(row[valueKey]);
       const labelW = w * 0.36;
-      addText(slide, clean(row[labelKey], 42), x, yy, labelW, 0.18, { fontSize: 7.6, color: palette.ink, margin: 0 });
+      addText(slide, clean(row[labelKey], 42), x, yy, labelW, 0.18, { fontSize: 8.2, color: palette.ink, margin: 0 });
       addRect(slide, x + labelW + 0.1, yy + 0.03, w - labelW - 0.55, 0.1, palette.gray);
       addRect(slide, x + labelW + 0.1, yy + 0.03, Math.max(0.08, (w - labelW - 0.55) * (pct / max)), 0.1, accent);
-      addText(slide, pct ? pct.toFixed(0) + '%' : '-', x + w - 0.36, yy - 0.01, 0.36, 0.16, { fontSize: 7, color: palette.muted, align: 'right', margin: 0 });
+      addText(slide, pct ? pct.toFixed(0) + '%' : '-', x + w - 0.36, yy - 0.01, 0.36, 0.16, { fontSize: 7.6, color: palette.muted, align: 'right', margin: 0 });
     });
   }
 
@@ -1576,7 +1625,7 @@ async function createRespondIqPptxBuffer(data, plan) {
       valign: 'top'
     };
     if (opts.fill) options.fill = { color: opts.fill };
-    if (opts.fontSize) options.fontSize = opts.fontSize;
+    if (opts.fontSize) options.fontSize = Math.max(opts.fontSize, opts.minFontSize || 7.4);
     return {
       text: clean(text, opts.max || 120, ''),
       options
@@ -1584,14 +1633,16 @@ async function createRespondIqPptxBuffer(data, plan) {
   }
 
   function addTable(slide, columns, rows, x, y, w, h, colW, accent = palette.navy, opts = {}) {
-    const header = columns.map(col => tableCell(col, { bold: true, color: accent, fill: opts.headerFill || palette.gray, max: opts.headerMax || 38, fontSize: opts.headerSize || 7.3, margin: opts.margin }));
-    const body = rows.map(row => row.map(cell => tableCell(cell, { max: opts.cellMax || 110, fontSize: opts.fontSize || 7.1, margin: opts.margin })));
+    const tableFontSize = Math.max(opts.fontSize || 7.8, opts.minFontSize || 7.4);
+    const headerFontSize = Math.max(opts.headerSize || 7.8, 7.4);
+    const header = columns.map(col => tableCell(col, { bold: true, color: accent, fill: opts.headerFill || palette.gray, max: opts.headerMax || 38, fontSize: headerFontSize, margin: opts.margin }));
+    const body = rows.map(row => row.map(cell => tableCell(cell, { max: opts.cellMax || 110, fontSize: tableFontSize, margin: opts.margin })));
     slide.addTable([header, ...body], {
       x, y, w, h,
       colW,
       border: { type: 'solid', color: palette.border, pt: 0.45 },
       fontFace: 'Aptos',
-      fontSize: opts.fontSize || 7.1,
+      fontSize: tableFontSize,
       color: palette.ink,
       valign: 'top',
       margin: 0.05
@@ -1618,10 +1669,11 @@ async function createRespondIqPptxBuffer(data, plan) {
     addRect(slide, 0, 0, W, 3.15, palette.navy);
     addRect(slide, 0, 3.15, W, 0.12, palette.orange);
     addRect(slide, 0.62, 0.6, 0.86, 0.05, palette.orange);
-    addText(slide, 'RESPONDIQ', 0.62, 0.85, 2.4, 0.28, { fontSize: 17, color: palette.white, bold: true, margin: 0 });
-    addText(slide, 'by Responsive Media Tech Services', 0.62, 1.18, 3.5, 0.18, { fontSize: 8, color: 'CBD5E1', margin: 0 });
+    addText(slide, 'RESPONDIQ', 0.62, 0.78, 2.4, 0.28, { fontSize: 17, color: palette.white, bold: true, margin: 0 });
+    addText(slide, 'by', 0.62, 1.08, 0.55, 0.16, { fontSize: 7.8, color: 'CBD5E1', margin: 0 });
+    addText(slide, 'Responsive MTS', 0.62, 1.25, 2.65, 0.2, { fontSize: 10.6, color: palette.white, bold: true, margin: 0 });
     addText(slide, campaign, 0.62, 1.72, 7.5, 0.72, { fontSize: campaign.length > 44 ? 28 : 34, color: palette.white, bold: true, margin: 0, max: 74 });
-    addText(slide, 'AI-powered media strategy and launch plan', 0.62, 2.52, 5.7, 0.24, { fontSize: 12, color: 'E2E8F0', margin: 0 });
+    addText(slide, 'Client-ready media strategy generated by the RespondIQ AI Engine', 0.62, 2.52, 6.4, 0.24, { fontSize: 12, color: 'E2E8F0', margin: 0 });
     addRect(slide, 0.62, 3.72, 12.1, 1.2, palette.white, palette.border);
     addRect(slide, 0.62, 3.72, 0.08, 1.2, palette.orange);
     addText(slide, 'Media Plan', 0.9, 4.02, 3.6, 0.35, { fontSize: 24, color: palette.ink, bold: true, margin: 0 });
@@ -1792,8 +1844,9 @@ async function createRespondIqPptxBuffer(data, plan) {
     addBackground(slide);
     addRect(slide, 0, 0, W, 2.0, palette.navy);
     addRect(slide, 0, 2.0, W, 0.1, palette.orange);
-    addText(slide, 'RESPONDIQ', 0.62, 0.75, 12.1, 0.28, { fontSize: 18, color: palette.white, bold: true, align: 'center', margin: 0 });
-    addText(slide, 'by Responsive Media Tech Services', 0.62, 1.08, 12.1, 0.18, { fontSize: 8.5, color: 'CBD5E1', align: 'center', margin: 0 });
+    addText(slide, 'RESPONDIQ', 0.62, 0.64, 12.1, 0.28, { fontSize: 18, color: palette.white, bold: true, align: 'center', margin: 0 });
+    addText(slide, 'by', 0.62, 0.98, 12.1, 0.16, { fontSize: 7.8, color: 'CBD5E1', align: 'center', margin: 0 });
+    addText(slide, 'Responsive MTS', 0.62, 1.17, 12.1, 0.22, { fontSize: 11, color: palette.white, bold: true, align: 'center', margin: 0 });
     addText(slide, 'Thank You', 0.62, 3.05, 12.1, 0.58, { fontSize: 36, color: palette.ink, bold: true, align: 'center', margin: 0 });
     addText(slide, 'Prepared for ' + brand, 0.62, 3.78, 12.1, 0.25, { fontSize: 12, color: palette.muted, align: 'center', margin: 0 });
     addRect(slide, 4.0, 4.62, 5.33, 0.9, 'FFF7ED', 'FFD7C2');
@@ -2083,14 +2136,16 @@ app.post('/generate-plan', async (req, res) => {
 
     // ── REFINE PLAN: User has an existing plan and wants changes ──
     if (requestBody.refine_instruction && requestBody.current_plan) {
-      console.log('[RespondIQ] Refine request:', requestBody.refine_instruction.substring(0, 80));
+      const safeRefineInstruction = redactKnownPersonalText(String(requestBody.refine_instruction || ''));
+      const safeCurrentPlan = redactKnownPersonalData(requestBody.current_plan || {});
+      console.log('[RespondIQ] Refine request:', safeRefineInstruction.substring(0, 80));
 
       const refineSystem = `You are a senior media strategist. The user has an existing media plan (JSON) and wants changes.
 Return the FULL updated JSON plan (not a partial diff).
 Maintain valid math: all budget_pct must sum to 100%, impressions must recalculate from budget changes, and all fields must remain populated.
 Return ONLY valid JSON, no markdown, no code fences, no explanation text.`;
 
-      const refineUser = `Here is the current media plan JSON:\n\n${JSON.stringify(requestBody.current_plan)}\n\nThe user wants the following change:\n"${requestBody.refine_instruction}"\n\nReturn the FULL updated JSON plan with this change applied. Recalculate all affected numbers (budget splits, impressions, KPIs) to maintain mathematical consistency. Return ONLY the JSON object.`;
+      const refineUser = `Here is the current media plan JSON:\n\n${JSON.stringify(safeCurrentPlan)}\n\nThe user wants the following change:\n"${safeRefineInstruction}"\n\nReturn the FULL updated JSON plan with this change applied. Recalculate all affected numbers (budget splits, impressions, KPIs) to maintain mathematical consistency. Return ONLY the JSON object.`;
 
       try {
         const refineText = await callGemini(refineSystem, [], refineUser, { maxOutputTokens: 8192 });
@@ -2106,7 +2161,7 @@ Return ONLY valid JSON, no markdown, no code fences, no explanation text.`;
     }
 
     // ── PRIORITY 2: Accept clean form_data from frontend (prompt built server-side) ──
-    const data = requestBody.form_data;
+    const data = stripPersonalFieldsForAI(requestBody.form_data || {});
     if (!data || !data.brandName) {
       return res.status(400).json({ error: 'Invalid request: form_data with brandName required' });
     }
