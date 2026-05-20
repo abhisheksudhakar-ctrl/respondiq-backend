@@ -177,9 +177,14 @@ function normalizeName(value) {
 function stripBusinessWords(words) {
   const noise = new Set([
     'the', 'llc', 'inc', 'ltd', 'co', 'corp', 'corporation', 'company', 'group',
-    'official', 'usa', 'us', 'uk', 'global', 'international', 'page'
+    'official', 'usa', 'us', 'uk', 'global', 'international', 'page', 'brand', 'brands',
+    'se', 'sa', 'ag', 'gmbh', 'plc', 'limited'
   ]);
   return words.filter(w => w && !noise.has(w));
+}
+
+function matchableTokens(value) {
+  return stripBusinessWords(normalizeName(value).split(/\s+/)).filter(Boolean);
 }
 
 function levenshteinRatio(a, b) {
@@ -241,6 +246,63 @@ function fuzzyMatchScore(pageName, query) {
     substringScore,
     tokenScore
   );
+}
+
+function scoreMetaPageMatch(pageName, query) {
+  const page = normalizeName(pageName);
+  const q = normalizeName(query);
+  if (!page || !q) return { accepted: false, score: 0, reason: 'empty_match' };
+
+  const pageCompact = page.replace(/\s+/g, '');
+  const qCompact = q.replace(/\s+/g, '');
+  const pageTokens = matchableTokens(page);
+  const queryTokens = matchableTokens(q);
+
+  if (page === q || pageCompact === qCompact) {
+    return { accepted: true, score: 1, reason: 'exact_name_match' };
+  }
+
+  if (!pageTokens.length || !queryTokens.length) {
+    return { accepted: false, score: 0, reason: 'empty_tokens' };
+  }
+
+  const pageSet = new Set(pageTokens);
+  const querySet = new Set(queryTokens);
+  const overlap = [...querySet].filter(token => pageSet.has(token)).length;
+  const recall = overlap / querySet.size;
+  const precision = overlap / pageSet.size;
+  const score = fuzzyMatchScore(pageName, query);
+
+  // Short one-word brands are especially risky in Meta search because the API
+  // returns ads whose copy contains the term. "PUMA" must not match
+  // "natus Puma Elmer 1076"; require an exact/suffix-style page identity.
+  if (queryTokens.length === 1) {
+    const token = queryTokens[0];
+    const allowedShortSuffixes = new Set([
+      'official', 'usa', 'us', 'uk', 'global', 'india', 'canada', 'australia',
+      'football', 'running', 'basketball', 'motorsport', 'sport', 'sports'
+    ]);
+    const extras = pageTokens.filter(t => t !== token);
+    const tokenIsFirst = pageTokens[0] === token;
+    const tokenIsOnlyOrOfficialVariant = tokenIsFirst && extras.length <= 2 && extras.every(t => allowedShortSuffixes.has(t));
+    if (pageTokens.length === 1 && pageTokens[0] === token) {
+      return { accepted: true, score: 1, reason: 'single_token_exact_match' };
+    }
+    if (tokenIsOnlyOrOfficialVariant) {
+      return { accepted: true, score: Math.max(score, 0.82), reason: 'single_token_official_variant' };
+    }
+    return { accepted: false, score, reason: 'short_brand_requires_exact_page_match' };
+  }
+
+  if (recall === 1 && precision >= 0.67 && score >= 0.72) {
+    return { accepted: true, score: Math.max(score, 0.78), reason: 'strong_token_match' };
+  }
+
+  if ((pageCompact.startsWith(qCompact) || qCompact.startsWith(pageCompact)) && score >= 0.82) {
+    return { accepted: true, score, reason: 'strong_prefix_match' };
+  }
+
+  return { accepted: false, score, reason: 'weak_name_match' };
 }
 
 function truncate(value, max) {
@@ -379,15 +441,15 @@ function buildRegionResult(query, region, ads) {
 
   let best = null;
   for (const page of grouped.values()) {
-    const score = fuzzyMatchScore(page.page_name, query);
-    if (score < 0.5) continue;
-    if (!best || score > best.score || (score === best.score && page.ads.length > best.ads.length)) {
-      best = { ...page, score };
+    const match = scoreMetaPageMatch(page.page_name, query);
+    if (!match.accepted) continue;
+    if (!best || match.score > best.score || (match.score === best.score && page.ads.length > best.ads.length)) {
+      best = { ...page, score: match.score, match_reason: match.reason };
     }
   }
 
   if (!best) {
-    return { query, found: false, reason: 'No high-confidence Meta page match' };
+    return { query, found: false, reason: 'No direct Meta page match' };
   }
 
   const sortedAds = best.ads.slice().sort((a, b) => {
@@ -415,7 +477,9 @@ function buildRegionResult(query, region, ads) {
     found: true,
     page_name: best.page_name,
     page_id: best.page_id,
-    match_confidence: best.score >= 0.8 ? 'high' : 'medium',
+    match_confidence: best.score >= 0.9 ? 'high' : 'medium',
+    match_score: Number(best.score.toFixed(2)),
+    match_reason: best.match_reason,
     ad_count: adCount,
     ad_count_indicator: adCount >= META_LIMIT ? adCount + '+' : String(adCount),
     activity_level: activityLevel(adCount),

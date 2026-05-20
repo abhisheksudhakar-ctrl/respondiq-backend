@@ -15,6 +15,37 @@ const { BENCHMARKS, BENCHMARK_SOURCES, resolveIndustryKey, buildBenchmarkPromptB
 
 const app = express();
 const PORT = process.env.PORT || 10000;
+const RESPONSIVE_MTS_LOGO_URL = 'https://responsivemts.com/wp-content/uploads/2025/06/ResponsiveMTS-LOGO_2018_Final-06-1024x298.png';
+const RESPONSIVE_MTS_LOGO_RATIO = 1024 / 298;
+let responsiveMtsLogoBufferPromise = null;
+
+async function getResponsiveMtsLogoBuffer() {
+  if (!responsiveMtsLogoBufferPromise) {
+    responsiveMtsLogoBufferPromise = (async () => {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 4000);
+      try {
+        const res = await fetch(RESPONSIVE_MTS_LOGO_URL, { signal: controller.signal });
+        if (!res.ok) {
+          console.warn('[RespondIQ] Responsive MTS logo fetch failed:', res.status);
+          return null;
+        }
+        return Buffer.from(await res.arrayBuffer());
+      } catch (err) {
+        console.warn('[RespondIQ] Responsive MTS logo unavailable:', err.message);
+        return null;
+      } finally {
+        clearTimeout(timer);
+      }
+    })();
+  }
+  return responsiveMtsLogoBufferPromise;
+}
+
+async function getResponsiveMtsLogoDataUri() {
+  const logoBuffer = await getResponsiveMtsLogoBuffer();
+  return logoBuffer ? 'data:image/png;base64,' + logoBuffer.toString('base64') : null;
+}
 
 // ── Strict CORS: Only allow requests from your frontend ──
 const ALLOWED_ORIGINS = [
@@ -504,6 +535,14 @@ function buildPlanningSignalsPromptBlock(signals) {
 }
 
 function buildSystemPrompt(data) {
+  const selectedChannels = Array.isArray(data.platformList) ? data.platformList.filter(Boolean) : [];
+  const selectedCreatives = Array.isArray(data.creativeList) ? data.creativeList.filter(Boolean) : [];
+  const channelLock = selectedChannels.length
+    ? `\n12. USER CHANNEL LOCK: The user explicitly selected these channels: ${selectedChannels.join(', ')}. You MUST NOT add, recommend, budget, flight, or create briefs for any unselected channel. If one channel is selected, the media mix must have exactly one channel at 100%.`
+    : '\n12. If no channels were selected by the user, recommend an appropriate media mix based on objective, budget, audience, and benchmarks.';
+  const creativeLock = selectedCreatives.length
+    ? `\n13. USER CREATIVE LOCK: The user explicitly selected these creative formats: ${selectedCreatives.join(', ')}. Creative briefs must use only these formats and must not recommend unselected formats.`
+    : '\n13. If no creative formats were selected by the user, recommend practical creative formats that fit the selected channels and available assets.';
   return `You are a senior media planner at a top agency preparing a real client deliverable. You must return ONLY valid JSON, no markdown, no code fences, no explanation text.
 
 ABSOLUTE RULES YOU CANNOT BREAK:
@@ -517,25 +556,28 @@ ABSOLUTE RULES YOU CANNOT BREAK:
 8. KPI targets must be realistic numbers based on industry benchmarks for ${data.industry}
 9. If website content is provided, READ IT CAREFULLY to understand what the business actually does before selecting competitors. The website content is the #1 source of truth for competitor matching.
 10. For every CPM, CPC, CTR, and industry benchmark figure, you MUST use your search capability to look up current rates before writing any number. Search for "[industry] average CPM 2025", "[channel] advertising benchmark [industry] 2025", "average CPC [channel] [industry]", and equivalent queries. Use ONLY search-verified rates, never use memorised training data for cost figures. If search returns a range, use the midpoint. Every benchmark in the benchmarks array must reference a figure you verified via search, not estimated from memory.
-11. Never show exact competitor ad counts in the plan. Use only High ad activity, Medium ad activity, Low ad activity, or Nil ad activity.`;
+11. Never show exact competitor ad counts in the plan. Use only High ad activity, Medium ad activity, Low ad activity, or Nil ad activity.${channelLock}${creativeLock}`;
 }
 
 function buildUserPrompt(data, bInfo, months, totalBudgetLow, totalBudgetHigh, totalBudgetMid, keywordData, competitorIntelBlock) {
   const funnelAdvice = FUNNEL_GUIDE[data.goal] || FUNNEL_GUIDE['Sales & Conversions'];
 
-  // ── Channel count cap: if >12 channels selected, instruct AI to consolidate ──
-  const MAX_PRIMARY_CHANNELS = 12;
-  const channelList = (data.platform || '').split(',').map(c => c.trim()).filter(Boolean);
-  const channelCount = channelList.length;
-  let channelCapInstruction = '';
-  if (channelCount > MAX_PRIMARY_CHANNELS) {
-    channelCapInstruction = `\nCHANNEL CONSOLIDATION REQUIRED: The user selected ${channelCount} channels, which is too many to allocate meaningful budget to. You MUST:
-1. Select the TOP ${MAX_PRIMARY_CHANNELS} most impactful channels for the "${data.goal}" goal in the ${data.industry} industry.
-2. Allocate budget ONLY to those ${MAX_PRIMARY_CHANNELS} channels (plus a Contingency line).
-3. In the media_strategy section, briefly note which channels were deprioritized and why.
-4. Do NOT spread budget equally across all ${channelCount} channels at 1% each, that creates zero impact. Concentrate spend where it drives results.
-5. Weight the top channels using goal-appropriate allocation (e.g., for Sales & Conversions: 25-30% search, 20% social, 15% retargeting, etc.).`;
-  }
+  const selectedChannels = Array.isArray(data.platformList) ? data.platformList.filter(Boolean) : [];
+  const selectedCreatives = Array.isArray(data.creativeList) ? data.creativeList.filter(Boolean) : [];
+  const channelSelectionInstruction = selectedChannels.length
+    ? `\nUSER SELECTED CHANNEL LOCK:
+- The user explicitly selected: ${selectedChannels.join(', ')}.
+- The output fields "channels", "budget_breakdown", "flight_plan", "creative_briefs", and channel-specific recommendations MUST include ONLY those selected channels.
+- Do NOT add Google Search, Meta, YouTube, CTV, retargeting, contingency, testing, or any other channel unless it is in the selected list above.
+- If exactly one channel is selected, allocate 100% to that channel and make the plan entirely about that channel.
+- Competitor SOV may describe competitor activity across the market, but the recommended plan itself must remain locked to the selected channel(s).`
+    : '\nUSER SELECTED CHANNEL LOCK: No channels were selected. Recommend the strongest channel mix for the brief.';
+  const creativeSelectionInstruction = selectedCreatives.length
+    ? `\nUSER SELECTED CREATIVE FORMAT LOCK:
+- The user explicitly selected: ${selectedCreatives.join(', ')}.
+- Creative briefs and recommendations MUST use only those selected creative formats.
+- Do NOT recommend unselected creative formats such as video, carousel, CTV, audio, or rich media unless they appear in the selected list above.`
+    : '\nUSER SELECTED CREATIVE FORMAT LOCK: No creative formats were selected. Recommend practical formats that fit the selected or recommended channels.';
 
   const competitorInstruction = data.competitors
     ? `The client has identified these key competitors: ${data.competitors}. Use these EXACT competitor names in your analysis. For each competitor, describe their actual known advertising approach, what platforms they advertise on, their messaging themes, their estimated market share, and their competitive strengths. Research what their ads look like on Google Ads Transparency Center, Meta Ad Library, and LinkedIn Ads.`
@@ -623,8 +665,9 @@ Target Location: ${data.location}${data.locationList && data.locationList.length
 Target Age: ${data.ageRange}
 Target Gender: ${data.gender}
 Household Income: ${data.income}
-Selected Channels: ${data.platform}${channelCapInstruction}
+Selected Channels: ${data.platform}${channelSelectionInstruction}
 Creative Formats: ${data.creativeFormat}
+${creativeSelectionInstruction}
 Known Competitors: ${data.competitors || 'Not specified, you must identify them based on the brand, website, industry, and company size'}
 ${data.pastPerformance ? 'Past Campaign Performance: ' + data.pastPerformance : ''}
 ${data.salesCycle ? 'Average Sales Cycle: ' + data.salesCycle : ''}
@@ -1046,7 +1089,32 @@ function stripPersonalFieldsForAI(raw = {}) {
   return redactKnownPersonalData(planningData, personal);
 }
 
-function createRespondIqPdfBuffer(data, plan) {
+const REFINE_PLAN_GUARDRAIL_MESSAGE = 'Please enter a media-plan refinement, such as changing budget, channels, audience, geography, creative, KPIs, competitors, timing, or recommendations.';
+
+function validateRefineInstruction(instruction) {
+  const normalized = String(instruction || '').trim().toLowerCase().replace(/\s+/g, ' ');
+  if (!normalized) return { valid: false, message: 'Please describe what you want to change.' };
+
+  const planTerms = /\b(media plan|plan|campaign|budget|spend|allocation|channel|channels|platform|platforms|search|shopping|google|meta|facebook|instagram|linkedin|tiktok|youtube|ctv|ott|display|programmatic|email|audience|audiences|segment|segments|targeting|geo|geography|location|locations|market|markets|competitor|competitors|creative|format|formats|ad|ads|copy|keyword|keywords|cpm|cpc|cpa|cpl|roas|ctr|cvr|kpi|impression|impressions|reach|frequency|flight|timeline|week|weeks|month|months|duration|objective|goal|recommendation|recommendations|next step|next steps|risk|benchmark|reporting|measurement|attribution|retargeting|remarketing|landing page|conversion|conversions|lead|leads|sale|sales|awareness|traffic|offer|funnel|gen z|millennial|persona|personas|buyer|buyers|customer|customers|industry|sector)\b/;
+  const editTerms = /\b(add|remove|change|update|shift|increase|decrease|reduce|replace|adjust|reallocate|rebalance|frontload|prioritize|prioritise|focus|target|exclude|include|optimize|optimise|emphasize|revise|make|allocate|move|swap|expand|narrow|split|raise|lower|turn|use|recommend|model|set|more|less|heavier|lighter|aggressive)\b/;
+  const generalQuestion = /^(what|who|when|where|why|how|tell me|explain|define|write|create|draft)\b/;
+  const offTopicTerms = /\b(java|python|javascript|code|coding|recipe|poem|song|joke|weather|stock price|president|capital of|homework|essay|story|movie|sports|news)\b/;
+  const hasPlanTerm = planTerms.test(normalized);
+  const hasEditTerm = editTerms.test(normalized);
+
+  if (offTopicTerms.test(normalized) && !(hasPlanTerm && hasEditTerm)) {
+    return { valid: false, message: REFINE_PLAN_GUARDRAIL_MESSAGE };
+  }
+  if (generalQuestion.test(normalized) && !(hasPlanTerm && hasEditTerm)) {
+    return { valid: false, message: REFINE_PLAN_GUARDRAIL_MESSAGE };
+  }
+  if (!hasPlanTerm || !hasEditTerm) {
+    return { valid: false, message: REFINE_PLAN_GUARDRAIL_MESSAGE };
+  }
+  return { valid: true, message: '' };
+}
+
+async function createRespondIqPdfBuffer(data, plan) {
   let PDFDocument;
   try {
     PDFDocument = require('pdfkit');
@@ -1061,6 +1129,7 @@ function createRespondIqPdfBuffer(data, plan) {
   const campaign = textValue(d.campaignName, 'Media Plan');
   const generatedAt = new Date().toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' });
   const totalBudget = totalCampaignBudget(d, p);
+  const responsiveMtsLogoBuffer = await getResponsiveMtsLogoBuffer();
 
   const doc = new PDFDocument({
     size: 'A4',
@@ -1185,6 +1254,25 @@ function createRespondIqPdfBuffer(data, plan) {
 
   function card(x, y, w, h, fill = palette.light, stroke = palette.border) {
     doc.roundedRect(x, y, w, h, 8).fillAndStroke(fill, stroke);
+  }
+
+  function drawResponsiveMtsLogo(x, y, w, h, options = {}) {
+    if (options.pill) {
+      doc.roundedRect(x, y, w, h, Math.min(12, h / 2)).fill('#ffffff');
+    }
+    if (!responsiveMtsLogoBuffer) {
+      const textColor = options.fallbackColor || palette.ink;
+      doc.font('Helvetica-Bold').fontSize(options.fallbackSize || 11).fillColor(textColor)
+        .text('Responsive MTS', x, y + h * 0.28, { width: w, align: options.align || 'center' });
+      return;
+    }
+    const padX = options.pill ? Math.min(10, w * 0.08) : 0;
+    const padY = options.pill ? Math.min(6, h * 0.22) : 0;
+    const maxW = Math.max(1, w - padX * 2);
+    const maxH = Math.max(1, h - padY * 2);
+    const logoH = Math.min(maxH, maxW / RESPONSIVE_MTS_LOGO_RATIO);
+    const logoW = logoH * RESPONSIVE_MTS_LOGO_RATIO;
+    doc.image(responsiveMtsLogoBuffer, x + (w - logoW) / 2, y + (h - logoH) / 2, { width: logoW, height: logoH });
   }
 
   function metricCards(metrics) {
@@ -1316,7 +1404,7 @@ function createRespondIqPdfBuffer(data, plan) {
     doc.rect(0, 170, doc.page.width, 8).fill(palette.orange);
     doc.font('Helvetica-Bold').fontSize(19).fillColor('#ffffff').text('RESPONDIQ', state.left, 62, { align: 'center', width: state.width });
     doc.font('Helvetica').fontSize(9).fillColor('#cbd5e1').text('by', state.left, 93, { align: 'center', width: state.width });
-    doc.font('Helvetica-Bold').fontSize(13).fillColor('#ffffff').text('Responsive MTS', state.left, 110, { align: 'center', width: state.width });
+    drawResponsiveMtsLogo(state.left + (state.width - 122) / 2, 108, 122, 31, { pill: true, fallbackColor: palette.navy });
     doc.font('Helvetica-Bold').fontSize(42).fillColor(palette.ink).text('Thank You', state.left, midY, { align: 'center', width: state.width });
     doc.font('Helvetica').fontSize(12).fillColor(palette.muted).text('Prepared for ' + brand, state.left, midY + 58, { align: 'center', width: state.width });
     card(state.left + 72, midY + 105, state.width - 144, 102, '#fff7ed', '#ffd7c2');
@@ -1334,7 +1422,7 @@ function createRespondIqPdfBuffer(data, plan) {
     doc.rect(state.left, 64, 66, 4).fill(palette.orange);
     doc.font('Helvetica-Bold').fontSize(20).fillColor('#ffffff').text('RESPONDIQ', state.left, 78, { width: state.width });
     doc.font('Helvetica').fontSize(9).fillColor('#cbd5e1').text('by', state.left, 106, { width: state.width });
-    doc.font('Helvetica-Bold').fontSize(13).fillColor('#ffffff').text('Responsive MTS', state.left, 121, { width: state.width });
+    drawResponsiveMtsLogo(state.left, 120, 118, 30, { pill: true, fallbackColor: palette.navy });
     const coverTitleSize = campaign.length > 46 ? 29 : campaign.length > 30 ? 34 : 38;
     doc.font('Helvetica-Bold').fontSize(coverTitleSize).fillColor('#ffffff').text(campaign, state.left, 154, { width: state.width - 38, height: 66, lineGap: 2, ellipsis: true });
     doc.font('Helvetica').fontSize(13).fillColor('#e2e8f0').text('Client-ready media strategy generated by the RespondIQ AI Engine', state.left, 229, { width: state.width - 40 });
@@ -1641,6 +1729,7 @@ async function createRespondIqPptxBuffer(data, plan) {
   const totalBudget = totalCampaignBudget(d, p);
   const isSalesGoal = ['Sales & Conversions', 'Customer Retention'].includes(d.goal);
   const primaryKpi = isSalesGoal ? p.target_roas : textValue(d.kpi).split('(')[0].trim();
+  const responsiveMtsLogoData = await getResponsiveMtsLogoDataUri();
 
   const pptx = new PptxGenJS();
   pptx.layout = 'LAYOUT_WIDE';
@@ -1702,6 +1791,33 @@ async function createRespondIqPptxBuffer(data, plan) {
       x, y, w, h,
       fill: { color: fill },
       line: { color: line, transparency: line === fill ? 100 : 0, pt: 0.7 }
+    });
+  }
+
+  function addResponsiveMtsLogo(slide, x, y, w, h, opts = {}) {
+    if (opts.pill) addRect(slide, x, y, w, h, palette.white, palette.white);
+    if (!responsiveMtsLogoData) {
+      addText(slide, 'Responsive MTS', x, y + h * 0.24, w, h * 0.52, {
+        fontSize: opts.fallbackSize || 10,
+        color: opts.fallbackColor || palette.ink,
+        bold: true,
+        align: opts.align || 'center',
+        margin: 0
+      });
+      return;
+    }
+    const padX = opts.pill ? Math.min(0.1, w * 0.08) : 0;
+    const padY = opts.pill ? Math.min(0.06, h * 0.2) : 0;
+    const maxW = Math.max(0.01, w - padX * 2);
+    const maxH = Math.max(0.01, h - padY * 2);
+    const logoH = Math.min(maxH, maxW / RESPONSIVE_MTS_LOGO_RATIO);
+    const logoW = logoH * RESPONSIVE_MTS_LOGO_RATIO;
+    slide.addImage({
+      data: responsiveMtsLogoData,
+      x: x + (w - logoW) / 2,
+      y: y + (h - logoH) / 2,
+      w: logoW,
+      h: logoH
     });
   }
 
@@ -1838,7 +1954,7 @@ async function createRespondIqPptxBuffer(data, plan) {
     addRect(slide, 0.62, 0.6, 0.86, 0.05, palette.orange);
     addText(slide, 'RESPONDIQ', 0.62, 0.78, 2.4, 0.28, { fontSize: 17, color: palette.white, bold: true, margin: 0 });
     addText(slide, 'by', 0.62, 1.08, 0.55, 0.16, { fontSize: 7.8, color: 'CBD5E1', margin: 0 });
-    addText(slide, 'Responsive MTS', 0.62, 1.25, 2.65, 0.2, { fontSize: 10.6, color: palette.white, bold: true, margin: 0 });
+    addResponsiveMtsLogo(slide, 0.62, 1.23, 1.55, 0.3, { pill: true, fallbackColor: palette.navy, align: 'left' });
     addText(slide, campaign, 0.62, 1.72, 7.5, 0.72, { fontSize: campaign.length > 44 ? 28 : 34, color: palette.white, bold: true, margin: 0, max: 74 });
     addText(slide, 'Client-ready media strategy generated by the RespondIQ AI Engine', 0.62, 2.52, 6.4, 0.24, { fontSize: 12, color: 'E2E8F0', margin: 0 });
     addRect(slide, 0.62, 3.72, 12.1, 1.2, palette.white, palette.border);
@@ -2007,7 +2123,7 @@ async function createRespondIqPptxBuffer(data, plan) {
     addRect(slide, 0, 2.0, W, 0.1, palette.orange);
     addText(slide, 'RESPONDIQ', 0.62, 0.64, 12.1, 0.28, { fontSize: 18, color: palette.white, bold: true, align: 'center', margin: 0 });
     addText(slide, 'by', 0.62, 0.98, 12.1, 0.16, { fontSize: 7.8, color: 'CBD5E1', align: 'center', margin: 0 });
-    addText(slide, 'Responsive MTS', 0.62, 1.17, 12.1, 0.22, { fontSize: 11, color: palette.white, bold: true, align: 'center', margin: 0 });
+    addResponsiveMtsLogo(slide, 5.55, 1.15, 2.23, 0.34, { pill: true, fallbackColor: palette.navy });
     addText(slide, 'Thank You', 0.62, 3.05, 12.1, 0.58, { fontSize: 36, color: palette.ink, bold: true, align: 'center', margin: 0 });
     addText(slide, 'Prepared for ' + brand, 0.62, 3.78, 12.1, 0.25, { fontSize: 12, color: palette.muted, align: 'center', margin: 0 });
     addRect(slide, 4.0, 4.62, 5.33, 0.9, 'FFF7ED', 'FFD7C2');
@@ -2300,8 +2416,18 @@ app.post('/generate-plan', async (req, res) => {
       const safeRefineInstruction = redactKnownPersonalText(String(requestBody.refine_instruction || ''));
       const safeCurrentPlan = redactKnownPersonalData(requestBody.current_plan || {});
       console.log('[RespondIQ] Refine request:', safeRefineInstruction.substring(0, 80));
+      const refineValidation = validateRefineInstruction(safeRefineInstruction);
+      if (!refineValidation.valid) {
+        console.warn('[RespondIQ] Refine rejected by guardrail:', safeRefineInstruction.substring(0, 80));
+        return res.status(400).json({
+          code: 'irrelevant_refine_instruction',
+          error: refineValidation.message
+        });
+      }
 
       const refineSystem = `You are a senior media strategist. The user has an existing media plan (JSON) and wants changes.
+Only apply requests that refine the media plan's budget, channels, audience, geography, creative, KPIs, competitors, timing, recommendations, or measurement.
+Do not answer unrelated questions, define unrelated concepts, write code, or add notes about off-topic content into the plan.
 Return the FULL updated JSON plan (not a partial diff).
 Maintain valid math: all budget_pct must sum to 100%, impressions must recalculate from budget changes, and all fields must remain populated.
 Return ONLY valid JSON, no markdown, no code fences, no explanation text.`;
